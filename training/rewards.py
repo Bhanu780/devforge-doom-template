@@ -6,7 +6,11 @@ Mirrors the scorer's categories: exit (largest), progression (keys, doors), expl
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+import navfield
 
 R = dict(
     exit=20.0,
@@ -22,7 +26,11 @@ R = dict(
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
     attack_no_target=-0.003,  # ATTACK with no enemy near the crosshair
-    fists_vs_far=-0.02,  # per step holding fists while a gun has ammo and an enemy is out of reach
+    fists_vs_far=-0.02,
+    # Potential-based shaping on walking distance to the exit (through missing keys), see navfield.py:
+    # +k per map unit closer, -k per unit farther, 0 standing still; telescopes, so loops can't farm it.
+    exit_dist=0.002,
+    exit_dist_clip=0.5,  # per step; teleports and unmodelled lifts make the distance jump  # per step holding fists while a gun has ammo and an enemy is out of reach
 )
 ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
 SLOT_MELEE = 1  # vitals[2]: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...
@@ -42,7 +50,14 @@ class Shaper:
         self.door_open = self._open(s)  # doors already open at spawn don't count
         self.door_ever = self.door_open.copy()
         self.prev_use = False
-        self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0)
+        self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0, prog=0.0)
+        self.nav = navfield.for_env(env) if R["exit_dist"] else None
+        self.d = self.d0 = self.dmin = self._exit_distance(s)
+
+    def _exit_distance(self, s) -> float:
+        if self.nav is None:
+            return math.inf
+        return self.nav.distance(s["x"], s["y"], navfield.colors_held(s["keys"]))
 
     @staticmethod
     def _cell(s):
@@ -82,6 +97,16 @@ class Shaper:
         if s["exit_reached"]:
             r += R["exit"] + R["exit_health"] * max(s["health"], 0)
             st["exit"] = 1
+            st["prog"] = 1.0
+        elif not terminated and self.nav is not None:
+            d = self._exit_distance(s)
+            if math.isfinite(d):
+                if math.isfinite(self.d):  # skip steps where the distance was undefined; keeps telescoping
+                    r += float(np.clip(R["exit_dist"] * (self.d - d), -R["exit_dist_clip"], R["exit_dist_clip"]))
+                self.d = d
+                self.dmin = min(self.dmin, d)
+                if math.isfinite(self.d0) and self.d0 > 0:
+                    st["prog"] = max(0.0, 1.0 - self.dmin / self.d0)
         if s["dead"]:
             r += R["death"]
             st["death"] = 1

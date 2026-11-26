@@ -92,7 +92,7 @@ def main():
             for wad, name, _ in layouts for seed in range(args.seeds)]
     with mp.get_context("spawn").Pool(args.procs) as pool:
         res = pool.map(run_one, jobs)
-    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "fists", "gun%", "score")
+    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "prog", "fists", "gun%", "score")
     print(f"{'map':32s} {'seed':>4s} " + " ".join(f"{k:>6s}" for k in keys))
     for r in res:
         print(f"{r['map']:32s} {r['seed']:4d} " + " ".join(f"{r[k]:6.1f}" for k in keys))

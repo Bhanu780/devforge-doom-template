@@ -188,7 +188,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--minibatches", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2.5e-4)
-    ap.add_argument("--gamma", type=float, default=0.995)
+    ap.add_argument("--gamma", type=float, default=0.997)
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.15)
     ap.add_argument("--ent", type=float, default=0.03)
@@ -404,7 +404,7 @@ def main():
         s = np.mean(stats, 0)
         sps = N * T / (time.time() - t0)
         if recent:
-            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic", "fists")}
+            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic", "fists", "prog")}
         else:
             m = {}
         print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
