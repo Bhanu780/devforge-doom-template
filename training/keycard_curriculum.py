@@ -1,5 +1,6 @@
 """Generate side-room practice maps and their training-only waypoint routes."""
 
+import argparse
 from pathlib import Path
 
 from keycard_map import CELL, cell_center, write_keycard_map
@@ -21,7 +22,7 @@ PRACTICE_LAYOUTS = (
 )
 
 
-def build_practice_map(directory: Path, layout_index: int, variation: int):
+def build_practice_map(directory: Path, layout_index: int, variation: int, *, combat: bool = False):
     branch, direction, depth, door, bend = PRACTICE_LAYOUTS[layout_index]
     main_row = 4
     exit_column = door + 2
@@ -39,9 +40,17 @@ def build_practice_map(directory: Path, layout_index: int, variation: int):
     grid[main_row][door] = "+"
     grid[main_row][exit_column] = "E"
 
+    if combat:
+        # Vary whether the encounter is on the way to the key or behind the door.
+        if variation < 3:
+            grid[main_row][branch - 1] = "Z"
+        if variation >= 2:
+            grid[main_row][door + 1] = "I"
+
     spawn_angles = (0, 90, 270, 180)
     spawn_offsets = ((0, 0), (15, -12), (-16, 15), (20, 4))
-    path = directory / f"side_room_{layout_index}_{variation}.wad"
+    name = f"combat_{layout_index:02d}_{variation}" if combat else f"side_room_{layout_index}_{variation}"
+    path = directory / f"{name}.wad"
     write_keycard_map(path, grid, spawn_angles[variation], spawn_offsets[variation])
     junction = cell_center((branch, main_row))
     key = cell_center((key_column, key_row))
@@ -60,3 +69,12 @@ def build_practice_map(directory: Path, layout_index: int, variation: int):
         ((exit_wall, corridor_y), "exit"),
     )
     return path, route
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate keycard practice maps populated with enemies.")
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    for layout in range(len(PRACTICE_LAYOUTS)):
+        for variation in range(4):
+            build_practice_map(args.output, layout, variation, combat=True)

@@ -139,3 +139,68 @@ python training/bench.py --weights training/runs/keycard_bends/candidate.pt --se
 
 Use the same checkpoint, seed list, and tick cap when comparing navigation maps
 and combat scenarios. The held-out suite measures transfer between layouts.
+
+## Train recovery from missed turns
+
+During extra practice rollouts, `--recovery-rate` lets the initial neural policy
+choose a share of the actions. The trainer records the corrective demonstration
+action for the actual observation and retains completed rollouts. This gives the
+policy practice recovering from its own mistakes. The controller runs only on
+the generated practice maps.
+
+```bash
+python training/imitate_keycard.py --run keycard_recovery --recovery-rate 0.25 --epochs 6 \
+  --init training/runs/keycard_bends/candidate.pt \
+  --combat-reference training/runs/balanced_progression/candidate.pt
+python training/train.py --run keycard_recovery --export --export-path training/runs/keycard_recovery/candidate.pt
+python training/keycard_map.py training/runs/keycard_holdout.wad
+python training/keycard_map.py training/runs/keycard_bent_holdout.wad --layout bent
+python training/bench.py --weights training/runs/keycard_recovery/candidate.pt \
+  --wad training/runs/keycard_holdout.wad --wad training/runs/keycard_bent_holdout.wad \
+  --seeds 4 --procs 2 --ticks 2100
+```
+
+Use `--first-seed 4` to run the next four seeds on both layouts.
+
+## Train combat and keycard progression together
+
+Generate practice layouts with a hitscan enemy before the key, a projectile
+enemy after the door, or both. Fine-tune a copy of the recovery checkpoint so
+the original stays available for comparison. Replace the run name when
+starting a new experiment.
+
+```bash
+python training/keycard_curriculum.py training/runs/keycard_combat_maps
+mkdir -p training/runs/keycard_combat_ppo
+cp training/runs/keycard_recovery/latest.pt training/runs/keycard_combat_ppo/latest.pt
+DOOM_GROUPS=progression=0.65,small=0.20,fd_early=0.15 python training/train.py \
+  --run keycard_combat_ppo --resume --practice-maps training/runs/keycard_combat_maps \
+  --workers 2 --episodes-per-map 1 --steps 128 --chunk 16 --epochs 2 \
+  --lr 0.0001 --ent 0.01 --ent-final 0.01 --curiosity 0.015 --max-updates 32 --save-every 8
+python training/train.py --run keycard_combat_ppo --export --export-path training/runs/keycard_combat_ppo/candidate.pt
+```
+
+Compare the candidate against the recovery checkpoint on the same validation
+maps, seeds, and tick cap. MAP04 stays in the validation pool.
+
+Add `--exclusive-movement` on a separate comparison run to let the model choose
+neither or one button in each opposing pair. PPO and the exported agent share
+that action distribution. Checkpoints saved before this option retain their
+original button sampling.
+
+## Weapon discipline experiment
+
+Add `--weapon-discipline` when fine-tuning from a copied recovery checkpoint.
+The policy uses an observation-based mask for fists when every visible target
+is out of melee range. Switching remains a learned action. During training,
+hits earn a small damage reward and cycling away from a loaded firearm in view
+of an enemy costs a small penalty. The hit counter is used only in training.
+The exported config keeps the mask consistent with PPO's action distribution.
+
+### Design references
+
+- [DeepDoom scenarios](https://github.com/Atlas-Soft/DeepDoom#scenarios) inform the door and exit curriculum.
+- [CleanRL recurrent PPO](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_lstm.py) is a reference for recurrent state reset and sequence batching.
+- [ViZDoom scenarios](https://github.com/Farama-Foundation/ViZDoom/blob/main/docs/environments/default.md) provide distinct combat and exploration practice tasks.
+- [StarNet demos](https://github.com/Trinkle23897/VizDoom2018-Track1) illustrate the combat-to-progression sequences we measure in the mixed maps.
+- [Curiosity-driven exploration](https://github.com/pathak22/noreward-rl) informs the novelty objective. This implementation uses counts from its own memory map.

@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "submission"))
 sys.path.insert(0, str(ROOT / "training"))
 
+from model.actions import mask_distant_punches, movement_logits, sample_exclusive  # noqa: E402
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
@@ -39,7 +40,7 @@ ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
 
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
-           curiosity: float, progression_only: bool, practice_maps: Path | None):
+           curiosity: float, progression_only: bool, practice_maps: Path | None, weapon_discipline: bool):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -52,7 +53,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     rng = np.random.default_rng(seed)
     pool = maps.build_pool("progression" if progression_only else "train", practice_maps)
     map_index = idx
-    env, fb, shaper = None, FeatureBuilder(), Shaper()
+    env, fb, shaper = None, FeatureBuilder(), Shaper(weapon_discipline)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -91,7 +92,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
                 env = None
                 continue
             fb.reset()
-            shaper.reset(env)
+            shaper.reset(env, obs)
             return obs
 
     obs = new_episode()
@@ -160,6 +161,13 @@ def bernoulli_logp_ent(logits, actions):
     return logp, ent
 
 
+def exclusive_logp_ent(logits, actions):
+    movement = torch.distributions.Categorical(logits=movement_logits(logits), validate_args=False)
+    choices = actions[..., :6:2].long() + 2 * actions[..., 1:6:2].long()
+    logp, entropy = bernoulli_logp_ent(logits[..., 6:], actions[..., 6:])
+    return logp + movement.log_prob(choices).sum(-1), entropy + movement.entropy().sum(-1)
+
+
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser()
@@ -181,6 +189,8 @@ def main():
     ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--practice-maps", type=Path, help="add generated WADs to the progression curriculum")
     ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
+    ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
+    ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--no-rgb", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--export", action="store_true")
@@ -203,6 +213,8 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_rgb = not args.no_rgb
+    exclusive_movement = args.exclusive_movement
+    weapon_discipline = args.weapon_discipline
     latest = run_dir / "latest.pt"
     ck = None
     if args.resume or args.export:
@@ -210,7 +222,12 @@ def main():
             ap.error(f"missing trained checkpoint: {latest}")
         ck = torch.load(latest, map_location=device, weights_only=False)
         use_rgb = ck["config"]["use_rgb"]
-    model = DoomPolicy(use_rgb=use_rgb).to(device)
+        exclusive_movement = exclusive_movement or ck["config"].get("exclusive_movement", False)
+        weapon_discipline = weapon_discipline or ck["config"].get("weapon_discipline", False)
+    model = DoomPolicy(use_rgb=use_rgb, hidden=ck["config"].get("hidden", 512) if ck else 512).to(device)
+    config = {"hidden": model.hidden, "use_rgb": use_rgb, "exclusive_movement": exclusive_movement,
+              "weapon_discipline": weapon_discipline}
+    action_stats = exclusive_logp_ent if exclusive_movement else bernoulli_logp_ent
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     ret_std = RunningStd()
     update, env_steps = 0, 0
@@ -225,7 +242,7 @@ def main():
         out = args.export_path
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
-                    "config": {"hidden": model.hidden, "use_rgb": use_rgb},
+                    "config": config,
                     "meta": {"update": update, "env_steps": env_steps}}, out)
         print(f"exported -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
         return
@@ -238,7 +255,7 @@ def main():
         p = ctx.Process(
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
-                  args.curiosity, args.progression_only, args.practice_maps),
+                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline),
             daemon=True,
         )
         p.start()
@@ -284,9 +301,11 @@ def main():
                 x = {k: v.unsqueeze(0) for k, v in to_torch(cur, device).items()}
                 d = torch.from_numpy(cur_first).to(device).unsqueeze(0)
                 logits, v, h = model(x, h, d)
+                if weapon_discipline:
+                    logits = mask_distant_punches(logits, x)
                 logits = logits[0]
-                a = torch.bernoulli(torch.sigmoid(logits))
-                lp, _ = bernoulli_logp_ent(logits, a)
+                a = sample_exclusive(logits) if exclusive_movement else torch.bernoulli(logits.sigmoid())
+                lp, _ = action_stats(logits, a)
             a_np = a.cpu().numpy().astype(np.int8)
             acts[t] = a_np
             logps[t] = lp.cpu().numpy()
@@ -354,7 +373,9 @@ def main():
                 x = {k: v[tt_t, ee_t] for k, v in tb_.items()}
                 h0 = H0[:, torch.from_numpy(mb).to(device)]
                 logits, v, _ = model(x, h0, FIRST[tt_t, ee_t])
-                lp, ent = bernoulli_logp_ent(logits, A[tt_t, ee_t])
+                if weapon_discipline:
+                    logits = mask_distant_punches(logits, x)
+                lp, ent = action_stats(logits, A[tt_t, ee_t])
                 ratio = torch.exp(lp - LP[tt_t, ee_t])
                 adv_b = ADV[tt_t, ee_t]
                 adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
@@ -391,7 +412,7 @@ def main():
             tb.add_scalar("train/kl", s[3], env_steps)
         if update % args.save_every == 0:
             ck = {"model": model.state_dict(), "opt": opt.state_dict(), "update": update, "env_steps": env_steps,
-                  "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": {"hidden": model.hidden, "use_rgb": use_rgb}}
+                  "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": config}
             torch.save(ck, run_dir / "latest.tmp")
             os.replace(run_dir / "latest.tmp", latest)
             if update % (args.save_every * 5) == 0:

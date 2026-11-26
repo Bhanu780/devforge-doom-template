@@ -66,22 +66,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="")
     ap.add_argument("--procs", type=int, default=4)
-    ap.add_argument("--wad", type=Path, help="evaluate one local WAD instead of a preset split")
+    ap.add_argument("--wad", type=Path, action="append", help="evaluate this WAD; repeat to compare layouts")
     ap.add_argument("--map", default="MAP01", help="map name for --wad")
     ap.add_argument("--split", choices=("val", "progression"), default="val")
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--first-seed", type=int, default=0, help="first seed in the benchmark range")
     ap.add_argument("--temperature", type=float, help="override policy sampling temperature for diagnostics")
     ap.add_argument("--ticks", type=int, default=4200)
     args = ap.parse_args()
+    if min(args.procs, args.seeds, args.ticks) < 1 or args.first_seed < 0:
+        ap.error("--procs, --seeds, and --ticks must be positive and --first-seed must be nonnegative")
     if args.temperature is not None and not (np.isfinite(args.temperature) and args.temperature > 0):
         ap.error("--temperature must be positive and finite")
     sys.path.insert(0, str(ROOT / "training"))
     import maps
 
     weights = str(Path(args.weights).resolve()) if args.weights else ""
-    layouts = [(str(args.wad.resolve()), args.map.upper(), "custom")] if args.wad else maps.build_pool(args.split)
+    layouts = ([(str(wad.resolve()), args.map.upper(), "custom") for wad in args.wad]
+               if args.wad else maps.build_pool(args.split))
+    seeds = range(args.first_seed, args.first_seed + args.seeds)
     jobs = [(wad, name, seed, args.ticks, weights, args.temperature)
-            for wad, name, _ in layouts for seed in range(args.seeds)]
+            for wad, name, _ in layouts for seed in seeds]
     with mp.get_context("spawn").Pool(args.procs) as pool:
         res = pool.map(run_one, jobs)
     keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")

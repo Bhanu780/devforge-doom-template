@@ -13,7 +13,16 @@ LAYOUT = (
     "#P.+.E#",
     "#######",
 )
+BENT_LAYOUT = (
+    "##########",
+    "###..K####",
+    "###.######",
+    "###.######",
+    "#P...+..E#",
+    "##########",
+)
 CELL = 128
+THING_TYPES = {"P": 1, "K": 13, "Z": 3004, "I": 3001}
 
 
 def cell_center(point: tuple[int, int]) -> tuple[float, float]:
@@ -49,13 +58,13 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
     for (x, y), tile in tiles.items():
         add("sector", heightfloor=0, heightceiling=0 if tile == "+" else 128,
             texturefloor="FLOOR4_8", textureceiling="CEIL3_5", lightlevel=192)
-        if tile in ("P", "K"):
+        if tile in THING_TYPES:
             px, py = cell_center((x, y))
             if tile == "P":
                 px += spawn_offset[0]
                 py += spawn_offset[1]
             add("thing", x=px, y=py, angle=spawn_angle if tile == "P" else 0,
-                type=1 if tile == "P" else 13,
+                type=THING_TYPES[tile],
                 skill1=True, skill2=True, skill3=True, skill4=True, skill5=True, single=True)
 
     for point, tile in tiles.items():
@@ -89,4 +98,6 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    write_keycard_map(parser.parse_args().output)
+    parser.add_argument("--layout", choices=("straight", "bent"), default="straight")
+    args = parser.parse_args()
+    write_keycard_map(args.output, BENT_LAYOUT if args.layout == "bent" else LAYOUT)

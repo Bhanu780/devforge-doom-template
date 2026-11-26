@@ -7,6 +7,7 @@ Mirrors the scorer's categories: exit (largest), progression (keys, doors), expl
 from __future__ import annotations
 
 import numpy as np
+from vizdoom import GameVariable
 
 R = dict(
     exit=20.0,
@@ -28,7 +29,10 @@ PLAYER_HEIGHT = 56.0
 
 
 class Shaper:
-    def reset(self, env) -> None:
+    def __init__(self, weapon_discipline: bool = False):
+        self.weapon_discipline = weapon_discipline
+
+    def reset(self, env, observation=None) -> None:
         s = env.privileged_state()
         self.prev = s
         self.cells = {self._cell(s)}
@@ -37,6 +41,10 @@ class Shaper:
         self.door_open = self._open(s)  # doors already open at spawn don't count
         self.door_ever = self.door_open.copy()
         self.prev_use = False
+        self.prev_switch = False
+        self.prev_observation = observation
+        if self.weapon_discipline:
+            self.damage_dealt = env._game.get_game_variable(GameVariable.DAMAGECOUNT)
         self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0)
 
     @staticmethod
@@ -89,6 +97,22 @@ class Shaper:
         self.prev_use = use
         if action[6] and not obs["visible_entities"]["mask"].any():
             r += R["attack_no_target"]
+        if self.weapon_discipline:
+            # ViZDoom's accumulated damage dealt is privileged training feedback.
+            dealt = env._game.get_game_variable(GameVariable.DAMAGECOUNT)
+            r += 0.018 * max(0.0, dealt - self.damage_dealt)
+            self.damage_dealt = dealt
+            switch = bool(action[8])
+            if switch and not self.prev_switch:
+                r -= 0.01
+                if self.prev_observation is not None:
+                    past = self.prev_observation
+                    entities = past["visible_entities"]
+                    enemy = entities["mask"].astype(bool) & np.isin(entities["entity_type"], (1, 2, 3))
+                    if past["vitals"][3] > 0 and enemy.any():
+                        r -= 0.05
+            self.prev_switch = switch
+            self.prev_observation = obs
         self.prev = s
         st["ret"] += r
         st["steps"] += 1
