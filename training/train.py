@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from copy import deepcopy
 import math
 import multiprocessing as mp
 import os
@@ -169,6 +170,22 @@ def exclusive_logp_ent(logits, actions):
     return logp + movement.log_prob(choices).sum(-1), entropy + movement.entropy().sum(-1)
 
 
+def navigation_kl(current, reference, exclusive):
+    """KL from the starting policy over movement and Use actions."""
+    def binary_kl(logits, old_logits):
+        targets = old_logits.sigmoid()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits
+        return (loss(logits, targets, reduction="none") - loss(old_logits, targets, reduction="none")).sum(dim=-1)
+
+    if not exclusive:
+        buttons = [0, 1, 2, 3, 4, 5, 7]
+        return binary_kl(current[..., buttons], reference[..., buttons]).mean()
+    current_moves = movement_logits(current).log_softmax(dim=-1)
+    reference_moves = movement_logits(reference).log_softmax(dim=-1)
+    move_kl = (reference_moves.exp() * (reference_moves - current_moves)).sum(dim=(-1, -2))
+    return (move_kl + binary_kl(current[..., 7:8], reference[..., 7:8])).mean()
+
+
 def combat_parameters(model):
     """Update attack and next-weapon outputs while keeping the navigation policy fixed."""
     model.requires_grad_(False)
@@ -207,6 +224,8 @@ def main():
     ap.add_argument("--combat-head-only", action=argparse.BooleanOptionalAction, default=None,
                     help="fine-tune attack and weapon outputs plus the critic")
     ap.add_argument("--loaded-switch-cost", type=float, default=0.05, help="training penalty for cycling a loaded weapon under fire")
+    ap.add_argument("--navigation-anchor", type=float, default=0.0,
+                    help="penalize drift in movement and Use from this run's starting policy")
     ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
     ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--no-rgb", action="store_true")
@@ -217,6 +236,10 @@ def main():
     ap.add_argument("--save-every", type=int, default=20)
     args = ap.parse_args()
 
+    if not math.isfinite(args.navigation_anchor) or args.navigation_anchor < 0:
+        ap.error("--navigation-anchor must be finite and nonnegative")
+    if args.save_every < 1 or args.max_updates < 1:
+        ap.error("--save-every and --max-updates must be positive")
     if not math.isfinite(args.loaded_switch_cost) or args.loaded_switch_cost < 0:
         ap.error("--loaded-switch-cost must be finite and nonnegative")
     if args.combat_head_only and not args.resume:
@@ -278,6 +301,15 @@ def main():
         print(f"exported -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
         return
 
+    anchor = None
+    if args.navigation_anchor:
+        anchor = deepcopy(model).requires_grad_(False).eval()
+        anchor_path = run_dir / "navigation_anchor.pt"
+        if anchor_path.is_file():
+            anchor.load_state_dict(torch.load(anchor_path, map_location=device, weights_only=True))
+        else:
+            torch.save(anchor.state_dict(), anchor_path)
+
     ctx = mp.get_context("spawn")
     conns, procs = [], []
     seed0 = args.seed + env_steps
@@ -298,6 +330,7 @@ def main():
     cur = stack([f[0] for f in first])
     cur_first = np.ones(N, np.float32)
     h = model.initial_state(N, device)
+    anchor_hidden = anchor.initial_state(N, device) if anchor is not None else None
 
     log_f = open(run_dir / "episodes.csv", "a", newline="")
     log = csv.writer(log_f)
@@ -307,8 +340,9 @@ def main():
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb = SummaryWriter(str(run_dir / "tb"))
-    except Exception:
+    except ImportError:
         tb = None
+        print("TensorBoard is unavailable; metrics are still written to episodes.csv.", flush=True)
 
     t_start = time.time()
     disc_ret = np.zeros(N, np.float64)
@@ -391,6 +425,10 @@ def main():
         RET = torch.from_numpy(rets).to(device)
         VOLD = torch.from_numpy(vals[:T]).to(device)
         FIRST = torch.from_numpy(firsts[:T]).to(device)
+        anchor_logits = None
+        if anchor is not None:
+            with torch.no_grad():
+                anchor_logits, _, anchor_hidden = anchor(tb_, anchor_hidden, FIRST)
         H0 = torch.cat(h_chunks, 1)  # (1, n_chunks*N, H), chunk-major
         seq_ids = np.arange(n_chunks * N)
         stats = []
@@ -415,14 +453,15 @@ def main():
                 v_clip = v_old + (v - v_old).clamp(-0.2, 0.2)
                 ret_b = RET[tt_t, ee_t]
                 vf = 0.5 * torch.max((v - ret_b) ** 2, (v_clip - ret_b) ** 2).mean()
-                loss = pg + 0.5 * vf - ent_coef * ent.mean()
+                anchor_loss = navigation_kl(logits, anchor_logits[tt_t, ee_t], exclusive_movement) if anchor_logits is not None else logits.new_zeros(())
+                loss = pg + 0.5 * vf - ent_coef * ent.mean() + args.navigation_anchor * anchor_loss
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 opt.step()
                 with torch.no_grad():
                     kl = ((ratio - 1) - torch.log(ratio)).mean().item()
-                stats.append((pg.item(), vf.item(), ent.mean().item(), kl))
+                stats.append((pg.item(), vf.item(), ent.mean().item(), kl, anchor_loss.item()))
         update += 1
         t_upd = time.time() - t0 - t_roll
 
@@ -432,7 +471,7 @@ def main():
             m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic")}
         else:
             m = {}
-        print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
+        print(f"upd {update} steps {env_steps:,} sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
               f"pg {s[0]:.3f} vf {s[1]:.3f} ent {s[2]:.2f} kl {s[3]:.4f} | "
               + " ".join(f"{k} {v:.2f}" for k, v in m.items()), flush=True)
         if tb is not None:
@@ -441,19 +480,23 @@ def main():
             tb.add_scalar("train/sps", sps, env_steps)
             tb.add_scalar("train/entropy", s[2], env_steps)
             tb.add_scalar("train/kl", s[3], env_steps)
-        if update % args.save_every == 0:
+            if anchor is not None:
+                tb.add_scalar("train/navigation_kl", s[4], env_steps)
+        if update % args.save_every == 0 or update == args.max_updates:
             ck = {"model": model.state_dict(), "opt": opt.state_dict(), "update": update, "env_steps": env_steps,
                   "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": config}
             torch.save(ck, run_dir / "latest.tmp")
             os.replace(run_dir / "latest.tmp", latest)
-            if update % (args.save_every * 5) == 0:
-                torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
-                            "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
-                           run_dir / f"policy_{env_steps // 1_000_000:04d}M.pt")
+            torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
+                        "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
+                       run_dir / f"policy_{env_steps:09d}.pt")
             log_f.flush()
 
     for c in conns:
         c.send(None)
+    log_f.close()
+    if tb is not None:
+        tb.close()
     print(f"done in {(time.time() - t_start) / 3600:.2f} h")
 
 

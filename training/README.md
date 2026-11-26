@@ -27,7 +27,7 @@ uv run tensorboard --logdir training/runs                          # watch ep/ex
 ```
 
 - Stop any time with Ctrl+C; continue with `--resume`. `latest.pt` is saved every 20 updates and an
-  fp16 snapshot `policy_XXXXM.pt` every 100 updates.
+  step-numbered FP16 snapshot `policy_000000000.pt` at each save interval.
 - Check a snapshot: `uv run python training/bench.py --weights training/runs/main/policy_0020M.pt --procs 6`.
 - Ship one: copy it to `submission/weights/policy.pt` (or `train.py --run main --export` for the latest), then
   `python validate.py --docker`, then `git add submission/weights/policy.pt && git commit && git push` (Git LFS).
@@ -299,3 +299,27 @@ python training/imitate_keycard.py --run gate_lessons --gate-lessons --arena-exi
   --combat-reference training/runs/arenas_full_policy/candidate.pt --epochs 5
 python training/train.py --run gate_lessons --export --export-path training/runs/gate_lessons/candidate.pt
 ```
+
+## Watch long runs in TensorBoard
+
+Install TensorBoard in the project environment and point it at the training run.
+The trainer writes the scalar files automatically.
+
+```bash
+source .venv/bin/activate
+uv pip install tensorboard
+tensorboard --logdir training/runs/long_gate_ppo --host 127.0.0.1 --port 6006
+```
+
+Open http://localhost:6006/ and select Scalars. `ep/exit` is the rolling training
+exit rate. `ep/death`, `ep/doors`, and `ep/cells` track the corresponding
+training outcomes. Compare saved checkpoints on a separate benchmark before
+choosing submission weights.
+
+For a longer PPO run, `--navigation-anchor 0.25` adds a soft penalty if movement
+and Use probabilities drift from the starting checkpoint. It leaves the attack
+and weapon-switch distributions outside that penalty. The trainer stores the
+reference in the run directory so it can be restored on resume. Pass the same
+anchor strength when resuming. Every save interval produces an immutable
+step-numbered export for evaluation, and the final update is saved even when
+it falls between intervals.
