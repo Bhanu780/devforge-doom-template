@@ -15,13 +15,15 @@ import torch
 from torch.nn import functional as F
 
 from doom_env import make_env
+from hard_levels import build_hard_set
 from keycard_curriculum import PRACTICE_LAYOUTS, build_practice_map
 from maps import build_pool
 from train import DoomPolicy, FeatureBuilder, ROOT, RunningStd, stack, to_torch
 
 
-def collect_episode(path, route, seed, use_rgb):
-    with closing(make_env(path, episode_ticks=2100, render_buffers=use_rgb)) as env:
+def collect_episode(path, route, seed, use_rgb, ticks=2100):
+    """Waypoints are ((x, y), purpose) or ((x, y), "door", sector) for a specific door sector."""
+    with closing(make_env(path, episode_ticks=ticks, render_buffers=use_rgb)) as env:
         observation, _ = env.reset(seed=seed)
         features = FeatureBuilder()
         features.reset()
@@ -30,15 +32,17 @@ def collect_episode(path, route, seed, use_rgb):
         last_use = -12
         while waypoint < len(route):
             state = env.privileged_state()
-            (target_x, target_y), purpose = route[waypoint]
+            (target_x, target_y), purpose, *door_sector = route[waypoint]
             dx, dy = target_x - state["x"], target_y - state["y"]
             distance = math.hypot(dx, dy)
             if purpose == "walk" and distance < 24:
                 waypoint += 1
                 continue
-            if purpose == "door" and state["sector_ceiling"][state["door_lock"] > 0].max() >= 90:
-                waypoint += 1
-                continue
+            if purpose == "door":
+                ceilings = state["sector_ceiling"][door_sector] if door_sector else state["sector_ceiling"][state["door_lock"] > 0]
+                if ceilings.max() >= 90:
+                    waypoint += 1
+                    continue
 
             heading = math.degrees(math.atan2(dy, dx))
             error = (heading - state["angle"] + 180) % 360 - 180
@@ -51,6 +55,10 @@ def collect_episode(path, route, seed, use_rgb):
                     last_use = len(actions)
             else:
                 action[0] = 1
+            # A monster blocking the corridor straight ahead: shoot it (rays stop at live monsters).
+            if observation["rays"]["hit_type"][0] == 4 or observation["rays"]["hit_type"][63] == 4 or observation["rays"]["hit_type"][1] == 4:
+                action[6] = 1
+                action[0] = 0
 
             inputs.append(features.step(observation))
             actions.append(action)
@@ -136,6 +144,8 @@ def main():
     parser.add_argument("--init", type=Path, help="optional initial policy checkpoint")
     parser.add_argument("--combat-reference", type=Path, help="retain examples from a prior combat policy")
     parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--hard-levels", type=int, default=0,
+                        help="also demonstrate this many generated hard levels (training/hard_levels.py)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.epochs < 1:
@@ -159,6 +169,14 @@ def main():
                 episodes.append(episode)
                 successes += 1
         print(f"layout {layout}: {successes}/4 completed demonstrations", flush=True)
+    if args.hard_levels:
+        successes = 0
+        for path, route, _ in build_hard_set(run / "maps", args.hard_levels, args.seed):
+            episode = collect_episode(path, route, args.seed, model.use_rgb, ticks=4200)
+            if episode is not None:
+                episodes.append(episode)
+                successes += 1
+        print(f"hard levels: {successes}/{args.hard_levels} completed demonstrations", flush=True)
     if not episodes:
         raise RuntimeError("No completed demonstrations; check the practice maps and waypoint route")
     if args.combat_reference:

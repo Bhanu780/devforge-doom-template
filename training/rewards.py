@@ -6,7 +6,11 @@ Mirrors the scorer's categories: exit (largest), progression (keys, doors), expl
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+import navfield
 
 R = dict(
     exit=20.0,
@@ -15,14 +19,23 @@ R = dict(
     door=1.0,
     locked_door=4.0,
     cell=0.1,  # new 128x128-unit area visited
-    kill=1.0,
+    kill=0.3,  # was 1.0: 20-40 kills per map out-paid the exit, so the bot farmed fights
     damage=-0.02,  # per HP lost
     death=-5.0,
     item=0.1,
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
-    attack_no_target=-0.003,
+    attack_no_target=-0.003,  # ATTACK with no enemy near the crosshair
+    fists_vs_far=-0.02,
+    # Potential-based shaping on walking distance to the exit (through missing keys), see navfield.py:
+    # +k per map unit closer, -k per unit farther, 0 standing still; telescopes, so loops can't farm it.
+    exit_dist=0.002,
+    exit_dist_clip=0.5,  # per step; teleports and unmodelled lifts make the distance jump  # per step holding fists while a gun has ammo and an enemy is out of reach
 )
+ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
+SLOT_MELEE = 1  # vitals[2]: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...
+MELEE_RANGE = 96.0  # same as submission/model/features.py
+AIM_SIN = 0.2  # |sin(rel_angle)| below this counts as "near the crosshair" (~11.5 deg)
 CELL = 128.0
 PLAYER_HEIGHT = 56.0
 
@@ -37,7 +50,14 @@ class Shaper:
         self.door_open = self._open(s)  # doors already open at spawn don't count
         self.door_ever = self.door_open.copy()
         self.prev_use = False
-        self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0)
+        self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0, prog=0.0)
+        self.nav = navfield.for_env(env) if R["exit_dist"] else None
+        self.d = self.d0 = self.dmin = self._exit_distance(s)
+
+    def _exit_distance(self, s) -> float:
+        if self.nav is None:
+            return math.inf
+        return self.nav.distance(s["x"], s["y"], navfield.colors_held(s["keys"]))
 
     @staticmethod
     def _cell(s):
@@ -48,6 +68,27 @@ class Shaper:
             return np.zeros(len(self.door_ids), bool)
         return (s["sector_ceiling"][self.door_ids] - s["sector_floor"][self.door_ids]) >= PLAYER_HEIGHT
 
+    @staticmethod
+    def _enemy_in_sights(obs) -> bool:
+        ent = obs["visible_entities"]
+        enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
+        return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
+
+    @staticmethod
+    def _enemy_visible(obs) -> bool:
+        ent = obs["visible_entities"]
+        return bool(np.any((np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)))
+
+    @staticmethod
+    def _fists_vs_far(obs) -> bool:
+        vit = np.asarray(obs["vitals"])
+        if int(vit[2]) != SLOT_MELEE or (vit[4] <= 0 and vit[5] <= 0):  # no bullets or shells: fists are all we have
+            return False
+        ent = obs["visible_entities"]
+        enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
+        d = np.asarray(ent["features"])[enemy, 0] * 1024.0
+        return bool(d.size and d.min() >= MELEE_RANGE)
+
     def step(self, env, action, obs, terminated: bool) -> float:
         s = env.privileged_state()
         p = self.prev
@@ -56,6 +97,16 @@ class Shaper:
         if s["exit_reached"]:
             r += R["exit"] + R["exit_health"] * max(s["health"], 0)
             st["exit"] = 1
+            st["prog"] = 1.0
+        elif not terminated and self.nav is not None:
+            d = self._exit_distance(s)
+            if math.isfinite(d):
+                if math.isfinite(self.d):  # skip steps where the distance was undefined; keeps telescoping
+                    r += float(np.clip(R["exit_dist"] * (self.d - d), -R["exit_dist_clip"], R["exit_dist_clip"]))
+                self.d = d
+                self.dmin = min(self.dmin, d)
+                if math.isfinite(self.d0) and self.d0 > 0:
+                    st["prog"] = max(0.0, 1.0 - self.dmin / self.d0)
         if s["dead"]:
             r += R["death"]
             st["death"] = 1
@@ -87,8 +138,11 @@ class Shaper:
         if use and not self.prev_use:
             r += R["use_press"]
         self.prev_use = use
-        if action[6] and not obs["visible_entities"]["mask"].any():
+        if action[6] and not self._enemy_in_sights(obs):
             r += R["attack_no_target"]
+        if self._fists_vs_far(obs):
+            r += R["fists_vs_far"]
+            st["fists"] = st.get("fists", 0) + 1
         self.prev = s
         st["ret"] += r
         st["steps"] += 1
