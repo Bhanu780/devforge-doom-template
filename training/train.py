@@ -33,7 +33,7 @@ from model.actions import mask_distant_punches, movement_logits, sample_exclusiv
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
-KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map")
+KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map", "act_mask")
 KEYS_INT = ("ray_type", "ent_type")
 KEYS_U8 = ("rgb",)
 ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
@@ -95,11 +95,27 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
                 continue
             fb.reset()
             shaper.reset(env, obs)
+            entries.clear()
+            last_cell[0] = None
             return obs
+
+    entries: dict = {}  # memory-map cell -> times the agent has entered it this episode
+    last_cell = [None]
+
+    def curiosity_bonus() -> float:
+        # Count-based novelty on the agent's OWN memory map (odometry cells, no ground truth), paid
+        # only on ENTERING a cell: c / sqrt(entries). Paying every step (as before) summed to
+        # ~2c*sqrt(steps) for standing still, which out-earned the step penalty and rewarded stalling.
+        key = fb.cell_key()
+        if key == last_cell[0]:
+            return 0.0
+        last_cell[0] = key
+        entries[key] = entries.get(key, 0) + 1
+        return curiosity / math.sqrt(entries[key])
 
     obs = new_episode()
     feats = fb.step(obs)
-    conn.send((feats, 0.0, True, None))
+    conn.send((feats, 0.0, True, None, None))
     while True:
         msg = conn.recv()
         if msg is None:
@@ -111,16 +127,17 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
         info = None
         if term or trunc:
             info = dict(shaper.stats, map=f"{Path(cur[0]).stem}:{cur[1]}")
+            # Time-limit truncation is not a real terminal: send the last observation so the learner
+            # can bootstrap with V(s_final) instead of 0 (the agent cannot see the remaining time).
+            final = fb.step(obs) if (trunc and not term) else None
             obs = new_episode()
             feats = fb.step(obs)
-            conn.send((feats, r, True, info))
+            conn.send((feats, r, True, info, final))
         else:
             feats = fb.step(obs)
-            # Intrinsic curiosity: count-based novelty on the agent's OWN memory map (odometry
-            # cells, no ground truth). New cells pay most; revisits decay as 1/sqrt(visits).
-            bonus = curiosity / math.sqrt(fb.visits_here())
+            bonus = curiosity_bonus() if curiosity > 0 else 0.0
             shaper.stats["intrinsic"] = shaper.stats.get("intrinsic", 0.0) + bonus
-            conn.send((feats, r + bonus, False, info))
+            conn.send((feats, r + bonus, False, info, None))
     if env is not None:
         env.close()
 
@@ -210,7 +227,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--minibatches", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2.5e-4)
-    ap.add_argument("--gamma", type=float, default=0.995)
+    ap.add_argument("--gamma", type=float, default=0.997)
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.15)
     ap.add_argument("--ent", type=float, default=0.03)
@@ -220,7 +237,6 @@ def main():
     ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--practice-maps", type=Path, help="add generated WADs to the progression curriculum")
     ap.add_argument("--arena-maps", type=Path, help="add generated combat arenas to the map pool")
-    ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
     ap.add_argument("--combat-head-only", action=argparse.BooleanOptionalAction, default=None,
                     help="fine-tune attack and weapon outputs plus the critic")
     ap.add_argument("--loaded-switch-cost", type=float, default=0.05, help="training penalty for cycling a loaded weapon under fire")
@@ -228,6 +244,7 @@ def main():
                     help="penalize drift in movement and Use from this run's starting policy")
     ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
     ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
+    ap.add_argument("--curiosity", type=float, default=0.05, help="intrinsic bonus per memory-map cell entry, / sqrt(entries) (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--export", action="store_true")
@@ -310,6 +327,9 @@ def main():
         else:
             torch.save(anchor.state_dict(), anchor_path)
 
+    import maps
+
+    maps.ensure_hard_levels()  # before the workers start, so they never race to write the WADs
     ctx = mp.get_context("spawn")
     conns, procs = [], []
     seed0 = args.seed + env_steps
@@ -353,6 +373,7 @@ def main():
         logps = np.zeros((T, N), np.float32)
         vals = np.zeros((T + 1, N), np.float32)
         rews = np.zeros((T, N), np.float32)
+        boot = np.zeros((T, N), np.float32)  # gamma * V(s_final) for time-limit truncations (normalised units)
         firsts = np.zeros((T + 1, N), np.float32)
         h_chunks = []
         model.eval()
@@ -381,6 +402,12 @@ def main():
             cur = stack([r[0] for r in res])
             rews[t] = [r[1] for r in res]
             cur_first = np.array([r[2] for r in res], np.float32)
+            trunc_ids = [i for i, r in enumerate(res) if r[4] is not None]
+            if trunc_ids:
+                with torch.no_grad():
+                    xf = {k: v.unsqueeze(0) for k, v in to_torch(stack([res[i][4] for i in trunc_ids]), device).items()}
+                    _, vf_, _ = model(xf, h[:, trunc_ids])
+                boot[t, trunc_ids] = args.gamma * vf_[0].cpu().numpy()
             for r in res:
                 if r[3] is not None:
                     info = r[3]
@@ -400,7 +427,7 @@ def main():
         for t in range(T):  # scale rewards by the spread of discounted returns (standard PPO practice)
             disc_ret = disc_ret * args.gamma * (1.0 - firsts[t]) + rews[t]
             ret_std.update(disc_ret)
-        r_n = np.clip(rews / ret_std.std, -10, 10)
+        r_n = np.clip(rews / ret_std.std, -10, 10) + boot
         adv = np.zeros((T, N), np.float32)
         last = 0.0
         for t in reversed(range(T)):
@@ -468,7 +495,7 @@ def main():
         s = np.mean(stats, 0)
         sps = N * T / (time.time() - t0)
         if recent:
-            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic")}
+            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic", "fists", "prog")}
         else:
             m = {}
         print(f"upd {update} steps {env_steps:,} sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
@@ -487,9 +514,11 @@ def main():
                   "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": config}
             torch.save(ck, run_dir / "latest.tmp")
             os.replace(run_dir / "latest.tmp", latest)
+            snapshot = run_dir / f"policy_{env_steps:09d}.pt"
             torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
                         "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
-                       run_dir / f"policy_{env_steps:09d}.pt")
+                       snapshot.with_suffix(".tmp"))
+            os.replace(snapshot.with_suffix(".tmp"), snapshot)
             log_f.flush()
 
     for c in conns:

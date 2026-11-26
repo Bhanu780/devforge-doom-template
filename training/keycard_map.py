@@ -22,10 +22,18 @@ BENT_LAYOUT = (
     "##########",
 )
 CELL = 128
-THING_TYPES = {
-    "P": 1, "K": 13, "Z": 3004, "I": 3001,
-    "S": 2001, "A": 2008, "H": 2012, "G": 9,
-}
+# Tile codes. "K" / "+" are the original red key / red locked door.
+KEY_THINGS = {"K": 13, "R": 13, "B": 5, "Y": 6}  # red, red, blue, yellow keycards
+DOOR_LOCKS = {"+": 1, "r": 1, "b": 2, "y": 3, "D": 0}  # ZDoom lock numbers; 0 = plain door
+MONSTER_THINGS = {"Z": 3004, "S": 9, "I": 3001, "G": 9}  # zombieman, shotgun guy, imp (all face west)
+DOORS = set(DOOR_LOCKS)
+THING_TYPES = {"P": 1, "W": 2001, "A": 2008, "H": 2012, **KEY_THINGS, **MONSTER_THINGS}
+
+
+def sector_index(layout) -> dict[tuple[int, int], int]:
+    """(x, y) tile -> sector number, in the order write_keycard_map creates sectors."""
+    tiles = [(x, y) for y, row in enumerate(layout) for x, tile in enumerate(row) if tile != "#"]
+    return {point: index for index, point in enumerate(tiles)}
 
 
 def cell_center(point: tuple[int, int]) -> tuple[float, float]:
@@ -34,7 +42,7 @@ def cell_center(point: tuple[int, int]) -> tuple[float, float]:
 
 
 def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
-                      spawn_offset: tuple[int, int] = (0, 0)) -> None:
+                      spawn_offset: tuple[int, int] = (0, 0), *, monster_angle: int = 180) -> None:
     blocks = ['namespace = "zdoom";']
     vertices = {}
 
@@ -59,15 +67,18 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
         return index
 
     for (x, y), tile in tiles.items():
-        add("sector", heightfloor=0, heightceiling=0 if tile in ("+", "D") else 128,
+        add("sector", heightfloor=0, heightceiling=0 if tile in DOORS else 128,
             texturefloor="FLOOR4_8", textureceiling="CEIL3_5", lightlevel=192)
         if tile in THING_TYPES:
             px, py = cell_center((x, y))
             if tile == "P":
                 px += spawn_offset[0]
                 py += spawn_offset[1]
-            add("thing", x=px, y=py, angle=spawn_angle if tile == "P" else 0,
-                type=THING_TYPES[tile],
+                kind, angle = 1, spawn_angle
+            else:
+                kind = THING_TYPES[tile]
+                angle = monster_angle if tile in MONSTER_THINGS else 0
+            add("thing", x=px, y=py, angle=angle, type=kind,
                 skill1=True, skill2=True, skill3=True, skill4=True, skill5=True, single=True)
 
     for point, tile in tiles.items():
@@ -80,7 +91,7 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
         )
         for neighbor, start, end in edges:
             other = tiles.get(neighbor)
-            if other is not None and (tile in ("+", "D") or (other not in ("+", "D") and point > neighbor)):
+            if other is not None and (tile in DOORS or (other not in DOORS and point > neighbor)):
                 continue
             exit_switch = tile == "E" and neighbor == (x + 1, y)
             fields = dict(v1=vertex(start), v2=vertex(end))
@@ -88,10 +99,12 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
                 fields.update(sidefront=side(point, "SW1EXIT" if exit_switch else "STARTAN3"), blocking=True)
             else:
                 fields.update(sidefront=side(point), sideback=side(neighbor), twosided=True)
-            if other == "+":
-                fields.update(special=13, arg1=32, arg2=150, arg3=1, playeruse=True, repeatspecial=True)
-            if other == "D":
-                fields.update(special=12, arg1=32, arg2=150, playeruse=True, repeatspecial=True)
+            if other in DOORS:
+                lock = DOOR_LOCKS[other]
+                if lock:  # Door_LockedRaise(tag 0 = back sector, speed, delay, lock)
+                    fields.update(special=13, arg1=32, arg2=150, arg3=lock, playeruse=True, repeatspecial=True)
+                else:  # Door_Open(tag 0 = back sector, speed): stays open, so routes that come back through it work
+                    fields.update(special=11, arg1=32, playeruse=True)
             if exit_switch:
                 fields.update(special=243, playeruse=True)
             add("linedef", **fields)

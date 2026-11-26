@@ -12,7 +12,7 @@ PRACTICE = {
         "#########",
         "#H....Z.#",
         "#.......#",
-        "#P.S...E#",
+        "#P.W...E#",
         "#.......#",
         "#..I..A.#",
         "#########",
@@ -23,14 +23,14 @@ PRACTICE = {
         "#..###...#",
         "#P.###..E#",
         "#..###...#",
-        "#S...I..H#",
+        "#W...I..H#",
         "##########",
     ),
     "choke": (
         "###########",
         "#....#..I.#",
         "#.H..#....#",
-        "#P.S...Z.E#",
+        "#P.W...Z.E#",
         "#....#....#",
         "#....#A...#",
         "###########",
@@ -39,7 +39,7 @@ PRACTICE = {
         "##########",
         "#..Z.....#",
         "#P..##...#",
-        "#S..##..E#",
+        "#W..##..E#",
         "#...##...#",
         "#H..I...A#",
         "##########",
@@ -54,7 +54,7 @@ VALIDATION = {
         "#P..Z.....E#",
         "#......##..#",
         "#...#G..A..#",
-        "#.S.#......#",
+        "#.W.#......#",
         "############",
     ),
     "split_cover": (
@@ -62,7 +62,7 @@ VALIDATION = {
         "#...Z#.....#",
         "#H...#..I..#",
         "#...##.....#",
-        "#P.S......E#",
+        "#P.W......E#",
         "#....###...#",
         "#..G.....A.#",
         "############",
@@ -76,7 +76,7 @@ def build_arenas(directory: Path, split: str) -> None:
     for name, layout in layouts.items():
         for variant, (angle, offset) in enumerate(starts):
             rows = layout[::-1] if variant % 2 else layout
-            write_keycard_map(directory / f"{split}_{name}_{variant}.wad", rows, angle, offset)
+            write_keycard_map(directory / f"{split}_{name}_{variant}.wad", rows, angle, offset, monster_angle=0)
 
 
 def build_exit_lessons(directory: Path):

@@ -49,15 +49,19 @@ class DoomAgent:
 
     @torch.no_grad()
     def act(self, observation: dict) -> np.ndarray:
-        feats = self.fb.step(observation)
-        x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
-        logits, _, self.h = self.model(x, self.h)
-        if self.weapon_discipline:
-            logits = mask_distant_punches(logits, x)
-        logits = logits[0, 0] / self.temperature
-        if self.exclusive_movement:
-            action = sample_exclusive_numpy(logits, self.rng)
-        else:
-            action = (self.rng.random(9) < logits.sigmoid().numpy()).astype(np.int8)
-        self.fb.note_action(action)
+        try:
+            feats = self.fb.step(observation)
+            x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
+            logits, _, self.h = self.model(x, self.h)
+            if self.weapon_discipline:
+                logits = mask_distant_punches(logits, x)
+            logits = logits[0, 0] / self.temperature
+            if self.exclusive_movement:
+                action = sample_exclusive_numpy(logits, self.rng)
+            else:
+                action = (self.rng.random(9) < logits.sigmoid().numpy()).astype(np.int8)
+            self.fb.note_action(action)
+        except Exception as exc:
+            print(f"[agent] act() error: {exc!r}", file=sys.stderr)
+            action = np.zeros(9, np.int8)
         return action

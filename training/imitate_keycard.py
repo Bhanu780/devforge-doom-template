@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from doom_env import make_env
 from combat_maps import build_exit_lessons
+from hard_levels import build_hard_set
 from keycard_curriculum import PRACTICE_LAYOUTS, build_gate_lessons, build_practice_map
 from maps import build_pool
 from train import DoomPolicy, FeatureBuilder, ROOT, RunningStd, stack, to_torch
@@ -23,9 +24,10 @@ from model.actions import mask_distant_punches, movement_logits, sample_exclusiv
 
 
 @torch.inference_mode()
-def collect_episode(path, route, seed, use_rgb, *, student=None, rng=None, recovery_rate=0.0,
+def collect_episode(path, route, seed, use_rgb, ticks=2100, *, student=None, rng=None, recovery_rate=0.0,
                     exclusive_movement=False, weapon_discipline=False):
-    with closing(make_env(path, episode_ticks=2100, render_buffers=use_rgb)) as env:
+    """Collect demonstrations with optional per-door sector waypoints."""
+    with closing(make_env(path, episode_ticks=ticks, render_buffers=use_rgb)) as env:
         observation, _ = env.reset(seed=seed)
         features = FeatureBuilder()
         features.reset()
@@ -37,14 +39,14 @@ def collect_episode(path, route, seed, use_rgb, *, student=None, rng=None, recov
             hidden = student.initial_state(1, device)
         while waypoint < len(route):
             state = env.privileged_state()
-            (target_x, target_y), purpose = route[waypoint]
+            (target_x, target_y), purpose, *door_sector = route[waypoint]
             dx, dy = target_x - state["x"], target_y - state["y"]
             distance = math.hypot(dx, dy)
             if purpose == "walk" and distance < 24:
                 waypoint += 1
                 continue
             if purpose == "door":
-                doors = state["door_lock"] >= 0
+                doors = door_sector or (state["door_lock"] >= 0)
                 heights = state["sector_ceiling"][doors] - state["sector_floor"][doors]
                 if np.any(heights >= 90):
                     waypoint += 1
@@ -60,6 +62,10 @@ def collect_episode(path, route, seed, use_rgb, *, student=None, rng=None, recov
                     action[7] = 1
             else:
                 action[0] = 1
+            # A monster blocking the corridor straight ahead: shoot it (rays stop at live monsters).
+            if observation["rays"]["hit_type"][0] == 4 or observation["rays"]["hit_type"][63] == 4 or observation["rays"]["hit_type"][1] == 4:
+                action[6] = 1
+                action[0] = 0
 
             frame = features.step(observation)
             inputs.append(frame)
@@ -184,6 +190,8 @@ def main():
     parser.add_argument("--arena-exits", action="store_true", help="add post-combat exit routes on practice arenas")
     parser.add_argument("--enable-rgb", action="store_true", help="train the visual encoder while retaining initial policy outputs")
     parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--hard-levels", type=int, default=0,
+                        help="also demonstrate this many generated hard levels (training/hard_levels.py)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.epochs < 1:
@@ -227,6 +235,14 @@ def main():
                 if recovery is not None:
                     recovered.append(recovery)
         print(f"layout {layout}: {successes}/4 completed demonstrations", flush=True)
+    if args.hard_levels:
+        successes = 0
+        for path, route, _ in build_hard_set(run / "maps", args.hard_levels, args.seed):
+            episode = collect_episode(path, route, args.seed, model.use_rgb, ticks=4200)
+            if episode is not None:
+                episodes.append(episode)
+                successes += 1
+        print(f"hard levels: {successes}/{args.hard_levels} completed demonstrations", flush=True)
     if not episodes:
         raise RuntimeError("No completed demonstrations; check the practice maps and waypoint route")
     if args.recovery_rate:

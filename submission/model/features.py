@@ -46,6 +46,39 @@ ENT_ENEMY = (1, 2, 3)
 ENT_KEY = 9
 ENT_ITEMS = (5, 6, 7, 8, 11)
 
+# --- weapons (vitals[2] = selected slot: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...) ----------
+SLOT_MELEE = 1
+MELEE_RANGE = 96.0  # map units: fist reach (64) plus monster radius
+BUTTON_ATTACK, BUTTON_NEXT_WEAPON = 6, 8
+
+
+def enemy_distances(obs: dict) -> np.ndarray:
+    """Map-unit distances of the visible enemies (empty if none)."""
+    ent = obs["visible_entities"]
+    sel = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENT_ENEMY)
+    return np.asarray(ent["features"], np.float32)[sel, 0] * RAY_RANGE
+
+
+def action_mask(obs: dict) -> np.ndarray:
+    """(9,) 1 = button allowed. Action masking from observation fields (docs/RULES.md section 1):
+    * holding a loaded gun with no enemy in melee range: SELECT_NEXT_WEAPON is blocked. In Doom one
+      press from the pistol wraps straight to the fists, so random presses left the bot punching at
+      enemies across the room.
+    * holding fists/chainsaw with no enemy in melee range: ATTACK is blocked (it only swings at air).
+    The network still decides everything else, including switching to fists when an enemy is close
+    and switching back to a gun when holding fists."""
+    mask = np.ones(9, np.float32)
+    vit = np.asarray(obs["vitals"], np.float32)
+    slot, ammo = int(vit[2]), float(vit[3])
+    d = enemy_distances(obs)
+    near = bool(d.size and d.min() < MELEE_RANGE)
+    if slot > SLOT_MELEE and ammo > 0 and not near:
+        mask[BUTTON_NEXT_WEAPON] = 0.0
+    if slot == SLOT_MELEE and not near:
+        mask[BUTTON_ATTACK] = 0.0
+    return mask
+
+
 RGB_H, RGB_W = 60, 80
 EXTRA_DIM = 17 + 9 + 6  # vitals + previous action + own features
 
@@ -171,6 +204,7 @@ class FeatureBuilder:
             "extra": extra,
             "map": self._crop(),
             "rgb": rgb_small(obs),
+            "act_mask": action_mask(obs),
         }
 
     def _unblock(self, obs: dict, fwd: float, right: float) -> tuple[float, float]:
@@ -283,6 +317,10 @@ class FeatureBuilder:
         if 0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE:
             return float(self.map[C_VISITED, cy, cx])
         return 1.0
+
+    def cell_key(self) -> tuple[int, int]:
+        """The agent's current memory-map cell in start-relative coordinates (unaffected by recentring)."""
+        return int(math.floor(self.x / CELL)), int(math.floor(self.y / CELL))
 
     def _crop(self) -> np.ndarray:
         c, s = math.cos(self.heading), math.sin(self.heading)

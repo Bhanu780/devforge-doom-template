@@ -51,11 +51,15 @@ def run_one(job):
         sh = Shaper()
         sh.reset(env)
         combat = {"fist": 0, "far_fist": 0, "switch": 0, "loaded": 0}
+        seen = gun = 0
         previous_switch = False
         progress = {"near_gate": 0, "gate_use": 0, "last_new": 0, "barrel_atk": 0}
         previous_use = False
         while True:
             action = agent.act(obs)
+            if sh._enemy_visible(obs):
+                seen += 1
+                gun += int(obs["vitals"][2]) >= 2
             if combat_stats:
                 entities = obs["visible_entities"]
                 alive = entities["mask"].astype(bool)
@@ -91,6 +95,8 @@ def run_one(job):
             if terminated or truncated:
                 break
         st = dict(sh.stats)
+        st["fists"] = st.get("fists", 0)
+        st["gun%"] = 100.0 * gun / seen if seen else 100.0
         if combat_stats:
             from vizdoom import GameVariable
 
@@ -119,7 +125,7 @@ def main():
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--wad", type=Path, action="append", help="evaluate this WAD; repeat to compare layouts")
     ap.add_argument("--map", default="MAP01", help="map name for --wad")
-    ap.add_argument("--split", choices=("val", "progression", "public"), default="val")
+    ap.add_argument("--split", choices=("val", "progression", "public", "hard"), default="val")
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--first-seed", type=int, default=0, help="first seed in the benchmark range")
     ap.add_argument("--temperature", type=float, help="override policy sampling temperature for diagnostics")
@@ -135,12 +141,14 @@ def main():
     import maps
 
     weights = str(Path(args.weights).resolve()) if args.weights else ""
+    if not args.wad and args.split != "public":
+        maps.ensure_hard_levels()
     layouts = ([(str(wad.resolve()), args.map.upper(), "custom") for wad in args.wad]
                if args.wad else maps.build_pool(args.split))
     seeds = range(args.first_seed, args.first_seed + args.seeds)
     jobs = [(wad, name, seed, args.ticks, weights, args.temperature, args.combat_stats, args.progress_stats)
             for wad, name, _ in layouts for seed in seeds]
-    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")
+    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score", "prog", "fists", "gun%")
     if args.combat_stats:
         keys += ("steps", "fist", "far_fist", "switch", "loaded", "hits")
     if args.progress_stats:

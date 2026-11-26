@@ -52,7 +52,7 @@ def build_practice_map(directory: Path, layout_index: int, variation: int, *, co
     spawn_offsets = ((0, 0), (15, -12), (-16, 15), (20, 4))
     name = f"combat_{layout_index:02d}_{variation}" if combat else f"side_room_{layout_index}_{variation}"
     path = directory / f"{name}.wad"
-    write_keycard_map(path, grid, spawn_angles[variation], spawn_offsets[variation])
+    write_keycard_map(path, grid, spawn_angles[variation], spawn_offsets[variation], monster_angle=0)
     junction = cell_center((branch, main_row))
     key = cell_center((key_column, key_row))
     corner = ((cell_center((branch, key_row)), "walk"),) if bend else ()

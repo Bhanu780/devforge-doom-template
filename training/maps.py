@@ -27,6 +27,27 @@ SCENARIO_NAMES = ["defend_the_center", "defend_the_line", "deadly_corridor", "he
 # Extra maps you add (any Doom/UDMF WAD): drop them in training/extra_maps/; all their maps are used.
 EXTRA_DIR = ROOT / "training" / "extra_maps"
 
+# Generated hard progression levels (training/hard_levels.py). Train and validation sets use
+# different seeds, so the validation layouts are never trained on. Written on first use by
+# ensure_hard_levels() (called by train.py and bench.py before any worker starts).
+HARD_DIR = ROOT / "training" / "runs" / "hard_maps"
+HARD_VAL_DIR = ROOT / "training" / "runs" / "hard_maps_val"
+HARD_TRAIN_COUNT, HARD_TRAIN_SEED = 60, 0
+HARD_VAL_COUNT, HARD_VAL_SEED = 9, 1000
+
+
+def ensure_hard_levels() -> None:
+    from hard_levels import build_hard_set
+
+    for directory, count, seed in ((HARD_DIR, HARD_TRAIN_COUNT, HARD_TRAIN_SEED), (HARD_VAL_DIR, HARD_VAL_COUNT, HARD_VAL_SEED)):
+        if len(list(directory.glob("hard_*.wad"))) < count:
+            build_hard_set(directory, count, seed)
+            print(f"generated {count} hard levels in {directory}", flush=True)
+
+
+def _hard_pool(directory: Path) -> list[tuple[str, str, str]]:
+    return [(str(wad), "MAP01", "hard") for wad in sorted(directory.glob("hard_*.wad"))]
+
 
 def _maps_in(wad: Path) -> list[str]:
     try:
@@ -37,9 +58,11 @@ def _maps_in(wad: Path) -> list[str]:
 
 def build_pool(split: str = "train", practice_maps: Path | None = None, arena_maps: Path | None = None) -> list[tuple[str, str, str]]:
     if split == "public":
-        return build_pool("train") + build_pool("val")
+        return [entry for entry in build_pool("train") + build_pool("val") if entry[2] != "hard"]
     if split == "progression":
-        return [entry for entry in build_pool("train", practice_maps, arena_maps) if entry[2] == "progression"]
+        return [entry for entry in build_pool("train", practice_maps, arena_maps) if entry[2] in ("progression", "hard")]
+    if split == "hard":  # held-out generated levels only
+        return _hard_pool(HARD_VAL_DIR)
     pool: list[tuple[str, str, str]] = []
     for m in _maps_in(FREEDOOM2):
         held = m in HELDOUT_FREEDOOM
@@ -63,10 +86,13 @@ def build_pool(split: str = "train", practice_maps: Path | None = None, arena_ma
         if arena_maps is not None:
             for wad in sorted(arena_maps.glob("*.wad")):
                 pool.extend((str(wad), m, "arena") for m in _maps_in(wad))
+        pool.extend(_hard_pool(HARD_DIR))
         if EXTRA_DIR.exists():
             for wad in sorted(EXTRA_DIR.glob("*.wad")):
                 for m in _maps_in(wad):
                     pool.append((str(wad), m, "fd"))
+    if split == "val":
+        pool.extend(_hard_pool(HARD_VAL_DIR))
     return pool
 
 
@@ -76,10 +102,10 @@ def group_weights(env_steps: int) -> dict[str, float]:
     if override:
         return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
     if env_steps < 3_000_000:
-        return {"arena": 0.30, "progression": 0.20, "small": 0.4, "fd_early": 0.4, "fd": 0.0}
+        return {"arena": 0.30, "progression": 0.15, "hard": 0.15, "small": 0.35, "fd_early": 0.35, "fd": 0.0}
     if env_steps < 8_000_000:
-        return {"arena": 0.30, "progression": 0.10, "small": 0.25, "fd_early": 0.35, "fd": 0.3}
-    return {"arena": 0.30, "progression": 0.05, "small": 0.20, "fd_early": 0.25, "fd": 0.5}
+        return {"arena": 0.30, "progression": 0.08, "hard": 0.17, "small": 0.20, "fd_early": 0.30, "fd": 0.25}
+    return {"arena": 0.30, "progression": 0.05, "hard": 0.15, "small": 0.15, "fd_early": 0.20, "fd": 0.45}
 
 
 def sample(pool, env_steps: int, rng: np.random.Generator):
