@@ -33,12 +33,6 @@ from model.actions import mask_distant_punches, movement_logits, sample_exclusiv
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
-KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map", "act_mask")
-KEYS_INT = ("ray_type", "ent_type")
-KEYS_U8 = ("rgb",)
-ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
-
-
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
            curiosity: float, progression_only: bool, practice_maps: Path | None,
@@ -55,7 +49,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     rng = np.random.default_rng(seed)
     pool = maps.build_pool("progression" if progression_only else "train", practice_maps, arena_maps)
     map_index = idx
-    env, fb, shaper = None, FeatureBuilder(), Shaper(weapon_discipline, loaded_switch_cost)
+    env, fb, shaper = None, FeatureBuilder(include_rgb=use_rgb), Shaper(weapon_discipline, loaded_switch_cost)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -162,7 +156,7 @@ class RunningStd:
 
 
 def stack(feat_list):
-    return {k: np.stack([f[k] for f in feat_list]) for k in ALL_KEYS}
+    return {k: np.stack([f[k] for f in feat_list]) for k in feat_list[0]}
 
 
 def to_torch(batch: dict, device):
@@ -348,6 +342,7 @@ def main():
     N, T = args.workers, args.steps
     first = [c.recv() for c in conns]
     cur = stack([f[0] for f in first])
+    rollout_keys = tuple(cur)
     cur_first = np.ones(N, np.float32)
     h = model.initial_state(N, device)
     anchor_hidden = anchor.initial_state(N, device) if anchor is not None else None
@@ -368,7 +363,7 @@ def main():
     disc_ret = np.zeros(N, np.float64)
     while update < args.max_updates:
         t0 = time.time()
-        buf = {k: np.zeros((T, N) + cur[k].shape[1:], cur[k].dtype) for k in ALL_KEYS}
+        buf = {k: np.zeros((T, N) + cur[k].shape[1:], cur[k].dtype) for k in rollout_keys}
         acts = np.zeros((T, N, 9), np.float32)
         logps = np.zeros((T, N), np.float32)
         vals = np.zeros((T + 1, N), np.float32)
@@ -380,7 +375,7 @@ def main():
         for t in range(T):
             if t % args.chunk == 0:
                 h_chunks.append(h.clone())
-            for k in ALL_KEYS:
+            for k in rollout_keys:
                 buf[k][t] = cur[k]
             firsts[t] = cur_first
             with torch.no_grad():

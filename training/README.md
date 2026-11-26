@@ -371,3 +371,10 @@ The checkpoint filenames contain the cumulative number of game decisions. Keep
 the starting weights and benchmark immutable snapshots on the same maps and
 seeds. The long run's local resume script records its mixture and exact
 training budget in the run directory.
+
+For a deadline-sized comparison, resume from a copied checkpoint with
+`--epochs 1 --minibatches 2`, set a short absolute `--max-updates`, and save
+at several intervals. One pass per rollout reduces learner time. Compare the
+candidate against its starting weights before using it. No-RGB rollouts omit
+the unused image tensors, and the recurrent model processes uninterrupted
+sequences in batches while resetting memory at episode boundaries.

@@ -112,13 +112,23 @@ class DoomPolicy(nn.Module):
         T, B = x["extra"].shape[:2]
         flat = {k: v.reshape(T * B, *v.shape[2:]) for k, v in x.items()}
         z = self.encode(flat).reshape(T, B, -1)
-        outs = []
-        for t in range(T):
-            if done is not None:
-                h = h * (1.0 - done[t]).view(1, B, 1)
-            o, h = self.gru(z[t:t + 1], h)
-            outs.append(o)
-        o = torch.cat(outs, 0)
+        if done is None:
+            o, h = self.gru(z, h)
+        elif T == 1:
+            o, h = self.gru(z, h * (1.0 - done[0]).view(1, B, 1))
+        else:
+            # Batch uninterrupted stretches in one GRU call, preserving episode resets.
+            boundaries = torch.nonzero(done.any(dim=1), as_tuple=True)[0].tolist()
+            outs = []
+            start = 0
+            for boundary in boundaries + [T]:
+                if boundary > start:
+                    output, h = self.gru(z[start:boundary], h)
+                    outs.append(output)
+                if boundary < T:
+                    h = h * (1.0 - done[boundary]).view(1, B, 1)
+                start = boundary
+            o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
         logits = self.pi(o)
         if "act_mask" in x:  # masked buttons: probability ~3e-7, identical in training and evaluation
             logits = logits.masked_fill(x["act_mask"] < 0.5, -15.0)
