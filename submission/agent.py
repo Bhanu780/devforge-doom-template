@@ -20,7 +20,10 @@ from model.actions import mask_distant_punches, sample_exclusive_numpy  # noqa: 
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
-TEMPERATURE = 0.7  # < 1 = less random than training, > 0 so fixed seeds can't trap us in a loop
+# Sample at the temperature PPO trained with. 0.7 sharpened an already-peaked policy: measured on Freedoom
+# MAP01-07 x 4 seeds (training/behavior_eval.py, two checkpoints), 1.0 cut deaths 36->29% and 54->39% and
+# shots at nothing by 27-47%, with equal or better coverage.
+TEMPERATURE = 1.0
 
 
 class DoomAgent:

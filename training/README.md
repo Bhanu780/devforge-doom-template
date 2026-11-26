@@ -349,11 +349,30 @@ python training/train.py --run hard --resume --practice-maps training/runs/hard_
 ## Weapon handling
 
 `features.action_mask()` masks two buttons from observation fields (allowed by docs/RULES.md §1),
-inside the network so training and evaluation match: SELECT_NEXT_WEAPON while holding a loaded gun
-with no enemy within 96 units (one press from the pistol wraps to the fists), and ATTACK while
-holding fists with no enemy within reach. The shaper adds `fists_vs_far` (-0.02 per step holding
-fists while bullets or shells remain and the nearest visible enemy is out of reach) so the policy
-learns to switch back. Episode logs report it as `fists`.
+inside the network so training and evaluation match: SELECT_NEXT_WEAPON while holding a gun that
+still has ammo (one press from the pistol wraps to the fists; Doom switches by itself when a gun runs
+dry or a better one is picked up), and ATTACK while holding fists with no enemy within reach. The
+shaper adds `fists_with_ammo` (-0.03 per step holding fists while bullets or shells remain) so the
+policy learns to switch back. Episode logs report it as `fists`.
+
+## Survival and momentum shaping (training/rewards.py)
+
+| Term | Value | Fixes |
+| --- | --- | --- |
+| `revisit` | -0.03 x min(entries - 2, 4) on the 3rd+ entry into a 128-unit area | backtracking through cleared rooms |
+| `cell` | +0.15 per new 128-unit area (was 0.1) | commits to unexplored ground |
+| `bump` | -0.01 per step holding FORWARD while moving < 6 units, no enemy in view | stair lips, angled-wall scraping |
+| `jitter` | -0.01 when the turn direction flips, no enemy in view | left/right dithering against walls |
+| `stall` | -0.02 per step after < 48 units of movement in 16 steps, no enemy in view | standing still |
+| cap | stall + bump + jitter + revisit <= 4.0 per episode | keeps dying (-8) worse than being stuck |
+| `damage` | -0.03/HP x (1 + 2 x missing-health fraction) | face-tanking at low HP |
+| `death` | -8 (was -5) | early deaths |
+| `health_gain` | +0.04/HP healed x (1 + 2 x missing fraction before) | walking past medkits (medkits never moved `items`) |
+| `seek_health` | +0.002 per unit closer to the nearest visible health pickup, below 60 HP | detours for medkits |
+| `armor_gain` | +0.01 per armour point | |
+| `under_fire_strafe` | +0.004 per step strafing within 12 steps of being hit | dodging instead of trading head-on |
+
+Episode logs add `revisits`, `bumps`, `healed` and `stall`.
 
 ## Longer mixed training
 

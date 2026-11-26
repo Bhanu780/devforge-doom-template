@@ -61,9 +61,10 @@ def enemy_distances(obs: dict) -> np.ndarray:
 
 def action_mask(obs: dict) -> np.ndarray:
     """(9,) 1 = button allowed. Action masking from observation fields (docs/RULES.md section 1):
-    * holding a loaded gun with no enemy in melee range: SELECT_NEXT_WEAPON is blocked. In Doom one
-      press from the pistol wraps straight to the fists, so random presses left the bot punching at
-      enemies across the room.
+    * holding a gun that still has ammo: SELECT_NEXT_WEAPON is blocked. In Doom one press from the
+      pistol wraps straight to the fists, and the bot did exactly that at point blank (it used to be
+      allowed with an enemy in melee range). Doom switches weapons by itself when a gun runs dry or a
+      better one is picked up, so nothing is lost.
     * holding fists/chainsaw with no enemy in melee range: ATTACK is blocked (it only swings at air).
     The network still decides everything else, including switching to fists when an enemy is close
     and switching back to a gun when holding fists."""
@@ -72,7 +73,7 @@ def action_mask(obs: dict) -> np.ndarray:
     slot, ammo = int(vit[2]), float(vit[3])
     d = enemy_distances(obs)
     near = bool(d.size and d.min() < MELEE_RANGE)
-    if slot > SLOT_MELEE and ammo > 0 and not near:
+    if slot > SLOT_MELEE and ammo > 0:
         mask[BUTTON_NEXT_WEAPON] = 0.0
     if slot == SLOT_MELEE and not near:
         mask[BUTTON_ATTACK] = 0.0
