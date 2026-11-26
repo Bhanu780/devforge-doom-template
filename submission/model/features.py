@@ -276,6 +276,14 @@ class FeatureBuilder:
             m[C_ITEM, max(cy - 1, 0):cy + 2, max(cx - 1, 0):cx + 2] = 0.0
             m[C_FREE, cy, cx] = 1.0
 
+    def visits_here(self) -> float:
+        """How many steps the agent has spent in its current memory-map cell (>= 1 after step()).
+        Used for the intrinsic curiosity reward during training."""
+        cx, cy = self._cell(self.x, self.y)
+        if 0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE:
+            return float(self.map[C_VISITED, cy, cx])
+        return 1.0
+
     def _crop(self) -> np.ndarray:
         c, s = math.cos(self.heading), math.sin(self.heading)
         wx = self.x + self._crop_fwd * c - self._crop_left * s

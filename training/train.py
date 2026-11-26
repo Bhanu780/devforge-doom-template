@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import multiprocessing as mp
 import os
 import sys
@@ -37,7 +38,7 @@ ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
 
 
 # ============================================================================ worker
-def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool):
+def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool, curiosity: float):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -104,7 +105,11 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool):
             conn.send((feats, r, True, info))
         else:
             feats = fb.step(obs)
-            conn.send((feats, r, False, info))
+            # Intrinsic curiosity: count-based novelty on the agent's OWN memory map (odometry
+            # cells, no ground truth). New cells pay most; revisits decay as 1/sqrt(visits).
+            bonus = curiosity / math.sqrt(fb.visits_here())
+            shaper.stats["intrinsic"] = shaper.stats.get("intrinsic", 0.0) + bonus
+            conn.send((feats, r + bonus, False, info))
     if env is not None:
         env.close()
 
@@ -164,6 +169,7 @@ def main():
     ap.add_argument("--ent-final", type=float, default=0.01)
     ap.add_argument("--total", type=float, default=60e6, help="env steps for the schedules")
     ap.add_argument("--episodes-per-map", type=int, default=3)
+    ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--export", action="store_true")
@@ -201,7 +207,7 @@ def main():
     seed0 = int(time.time()) % 100000
     for i in range(args.workers):
         a, b = ctx.Pipe()
-        p = ctx.Process(target=worker, args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb), daemon=True)
+        p = ctx.Process(target=worker, args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb, args.curiosity), daemon=True)
         p.start()
         conns.append(a)
         procs.append(p)
@@ -337,7 +343,7 @@ def main():
         s = np.mean(stats, 0)
         sps = N * T / (time.time() - t0)
         if recent:
-            m = {k: np.mean([e[k] for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps")}
+            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic")}
         else:
             m = {}
         print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
