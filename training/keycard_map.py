@@ -59,7 +59,7 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
         return index
 
     for (x, y), tile in tiles.items():
-        add("sector", heightfloor=0, heightceiling=0 if tile == "+" else 128,
+        add("sector", heightfloor=0, heightceiling=0 if tile in ("+", "D") else 128,
             texturefloor="FLOOR4_8", textureceiling="CEIL3_5", lightlevel=192)
         if tile in THING_TYPES:
             px, py = cell_center((x, y))
@@ -80,7 +80,7 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
         )
         for neighbor, start, end in edges:
             other = tiles.get(neighbor)
-            if other is not None and (tile == "+" or (other != "+" and point > neighbor)):
+            if other is not None and (tile in ("+", "D") or (other not in ("+", "D") and point > neighbor)):
                 continue
             exit_switch = tile == "E" and neighbor == (x + 1, y)
             fields = dict(v1=vertex(start), v2=vertex(end))
@@ -90,6 +90,8 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
                 fields.update(sidefront=side(point), sideback=side(neighbor), twosided=True)
             if other == "+":
                 fields.update(special=13, arg1=32, arg2=150, arg3=1, playeruse=True, repeatspecial=True)
+            if other == "D":
+                fields.update(special=12, arg1=32, arg2=150, playeruse=True, repeatspecial=True)
             if exit_switch:
                 fields.update(special=243, playeruse=True)
             add("linedef", **fields)

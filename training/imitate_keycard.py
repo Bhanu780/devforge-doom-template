@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from doom_env import make_env
 from combat_maps import build_exit_lessons
-from keycard_curriculum import PRACTICE_LAYOUTS, build_practice_map
+from keycard_curriculum import PRACTICE_LAYOUTS, build_gate_lessons, build_practice_map
 from maps import build_pool
 from train import DoomPolicy, FeatureBuilder, ROOT, RunningStd, stack, to_torch
 from model.actions import mask_distant_punches, movement_logits, sample_exclusive, sample_exclusive_numpy
@@ -43,9 +43,12 @@ def collect_episode(path, route, seed, use_rgb, *, student=None, rng=None, recov
             if purpose == "walk" and distance < 24:
                 waypoint += 1
                 continue
-            if purpose == "door" and state["sector_ceiling"][state["door_lock"] > 0].max() >= 90:
-                waypoint += 1
-                continue
+            if purpose == "door":
+                doors = state["door_lock"] >= 0
+                heights = state["sector_ceiling"][doors] - state["sector_floor"][doors]
+                if np.any(heights >= 90):
+                    waypoint += 1
+                    continue
 
             heading = math.degrees(math.atan2(dy, dx))
             error = (heading - state["angle"] + 180) % 360 - 180
@@ -177,6 +180,7 @@ def main():
     parser.add_argument("--combat-reference", type=Path, help="retain examples from a prior combat policy")
     parser.add_argument("--recovery-rate", type=float, default=0.0,
                         help="probability of letting the initial policy act in a recovery rollout")
+    parser.add_argument("--gate-lessons", action="store_true", help="add practice gates approached from varied directions")
     parser.add_argument("--arena-exits", action="store_true", help="add post-combat exit routes on practice arenas")
     parser.add_argument("--enable-rgb", action="store_true", help="train the visual encoder while retaining initial policy outputs")
     parser.add_argument("--epochs", type=int, default=8)
@@ -228,6 +232,16 @@ def main():
     if args.recovery_rate:
         print(f"adding {len(recovered)}/{2 * len(PRACTICE_LAYOUTS)} completed recovery episodes", flush=True)
         episodes.extend(recovered)
+    if args.gate_lessons:
+        gate_episodes = []
+        for path, route in build_gate_lessons(run / "gate_maps"):
+            episode = collect_episode(path, route, args.seed, model.use_rgb)
+            if episode is not None:
+                gate_episodes.append(episode)
+        if not gate_episodes:
+            raise RuntimeError("No gate demonstration completed")
+        print(f"adding {len(gate_episodes)} completed gate lessons", flush=True)
+        episodes.extend(gate_episodes)
     if args.arena_exits:
         arena_episodes = []
         for path, route in build_exit_lessons(run / "exit_maps"):

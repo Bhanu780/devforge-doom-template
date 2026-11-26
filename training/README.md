@@ -271,3 +271,31 @@ python training/train.py --run arena_exit_rgb --export --export-path training/ru
 
 Compare the finished checkpoint on the reserved arena floor plans, keycard maps,
 and broader Freedoom suite before continuing PPO or promoting it.
+
+## Sweep the public maps and diagnose gate stalls
+
+Use the public split to run all bundled Freedoom maps, ViZDoom scenarios, the
+official two-room map, and the repository's test fixtures. It reports attempts
+with errors separately and prints a row as each episode finishes. Use this as a
+diagnostic across the public material. The `val` split and reserved WADs remain
+separate from checkpoint training.
+
+```bash
+python training/bench.py --weights training/runs/arenas_combat_only/candidate.pt \
+  --split public --seeds 1 --ticks 4200 --procs 2 --combat-stats --progress-stats
+```
+
+`near_gate` counts decisions with a door ray close and ahead. `gate_use` counts
+fresh Use presses during those decisions. `stale_tail` counts decisions since
+the last newly visited cell. These are local diagnostics, separate from the
+official scoring criteria.
+
+Train gate and exit interaction on authored rooms with doors approached from
+several sides and varied initial headings.
+
+```bash
+python training/imitate_keycard.py --run gate_lessons --gate-lessons --arena-exits \
+  --init training/runs/arenas_combat_only/candidate.pt \
+  --combat-reference training/runs/arenas_full_policy/candidate.pt --epochs 5
+python training/train.py --run gate_lessons --export --export-path training/runs/gate_lessons/candidate.pt
+```

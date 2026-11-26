@@ -36,6 +36,8 @@ def _maps_in(wad: Path) -> list[str]:
 
 
 def build_pool(split: str = "train", practice_maps: Path | None = None, arena_maps: Path | None = None) -> list[tuple[str, str, str]]:
+    if split == "public":
+        return build_pool("train") + build_pool("val")
     if split == "progression":
         return [entry for entry in build_pool("train", practice_maps, arena_maps) if entry[2] == "progression"]
     pool: list[tuple[str, str, str]] = []
