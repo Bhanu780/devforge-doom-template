@@ -93,3 +93,17 @@ Use W/S to move forward/back, A/D to strafe, left/right arrows to turn, Space to
 shoot, E to use doors and switches, Q to cycle weapons, and Esc to quit.
 Restart the command for another episode. To try a different layout, supply
 `--wad path/to/map.wad --map MAP01`.
+
+Press R to restart the current episode. The result screen distinguishes a completed
+level, a death, and a time limit.
+
+Generate and play the side-room keycard layout, then benchmark a checkpoint on it.
+
+```bash
+python training/keycard_map.py training/runs/keycard_holdout.wad
+python training/play.py --wad training/runs/keycard_holdout.wad
+python training/bench.py --wad training/runs/keycard_holdout.wad --seeds 4 --procs 2
+```
+
+This layout is outside the training map pool. Keep it out of `training/extra_maps/`
+when measuring generalization.
