@@ -424,3 +424,10 @@ DOOM_GROUPS=fd_early=0.40,fd=0.10,arena=0.15,small=0.10,progression=0.20,hard=0.
 Compare MAP01 runs with `behavior_eval.py --maps MAP01 --seeds 2 --ticks 4200`.
 MAP01 is a development map in the training pool. Check transfer with `bench.py --split hard`
 and reserved Freedoom maps such as MAP04.
+
+`--height-safe-shaping` disables the planar exit-distance reward when a level has
+two-sided openings with a floor height difference above the vanilla walking
+limit. For example, the planar field in Freedoom MAP01 estimates a shorter route
+straight across a 64-unit ledge. The other progression, survival, and exploration
+rewards stay active. This is a conservative check at episode reset. It does not
+model lifts or resolve routes across ledges.

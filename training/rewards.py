@@ -62,10 +62,11 @@ MOVE_PENALTY_CAP = 4.0
 
 class Shaper:
     def __init__(self, weapon_discipline: bool = False, loaded_switch_cost: float = 0.05,
-                 *, recovery_feedback: bool = False):
+                 *, recovery_feedback: bool = False, height_safe_shaping: bool = False):
         self.weapon_discipline = weapon_discipline
         self.loaded_switch_cost = loaded_switch_cost
         self.recovery_feedback = recovery_feedback
+        self.height_safe_shaping = height_safe_shaping
 
     def reset(self, env, observation=None) -> None:
         s = env.privileged_state()
@@ -81,7 +82,8 @@ class Shaper:
         if self.weapon_discipline:
             self.damage_dealt = env._game.get_game_variable(GameVariable.DAMAGECOUNT)
         self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0, prog=0.0)
-        self.nav = navfield.for_env(env) if R["exit_dist"] else None
+        planar = not self.height_safe_shaping or navfield.supports_planar_shaping(env.mapinfo, s["sector_floor"])
+        self.nav = navfield.for_env(env) if R["exit_dist"] and planar else None
         self.d = self.d0 = self.dmin = self._exit_distance(s)
         self.trail = [(s["x"], s["y"])]  # recent positions, for the stall penalty
         self.entries = {self._cell(s): 1}  # 128-unit area -> times entered this episode

@@ -37,7 +37,7 @@ from model.policy import DoomPolicy  # noqa: E402
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
            curiosity: float, progression_only: bool, practice_maps: Path | None,
            weapon_discipline: bool, loaded_switch_cost: float, arena_maps: Path | None,
-           collision_aware: bool):
+           collision_aware: bool, height_safe_shaping: bool):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -52,7 +52,8 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     map_index = idx
     env = None
     fb = FeatureBuilder(include_rgb=use_rgb, collision_aware=collision_aware)
-    shaper = Shaper(weapon_discipline, loaded_switch_cost, recovery_feedback=collision_aware)
+    shaper = Shaper(weapon_discipline, loaded_switch_cost, recovery_feedback=collision_aware,
+                    height_safe_shaping=height_safe_shaping)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -243,6 +244,8 @@ def main():
     ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
     ap.add_argument("--collision-aware", action="store_true",
                     help="use ray-corrected stall observations and train with wall recovery and tighter aim feedback")
+    ap.add_argument("--height-safe-shaping", action="store_true",
+                    help="skip planar exit-distance rewards on maps with steep ledges")
     ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--curiosity", type=float, default=0.05, help="intrinsic bonus per memory-map cell entry, / sqrt(entries) (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
@@ -284,6 +287,7 @@ def main():
     exclusive_movement = args.exclusive_movement
     weapon_discipline = args.weapon_discipline
     collision_aware = args.collision_aware
+    height_safe_shaping = args.height_safe_shaping
     latest = run_dir / "latest.pt"
     ck = None
     input_weights = latest if args.resume or args.export else args.init_weights
@@ -297,12 +301,13 @@ def main():
         exclusive_movement = exclusive_movement or ck["config"].get("exclusive_movement", False)
         weapon_discipline = weapon_discipline or ck["config"].get("weapon_discipline", False)
         collision_aware = collision_aware or ck["config"].get("collision_aware", False)
+        height_safe_shaping = height_safe_shaping or (args.resume and ck["config"].get("height_safe_shaping", False))
     prior_combat_only = bool(ck and ck["config"].get("combat_head_only", False))
     combat_only = prior_combat_only if args.combat_head_only is None else args.combat_head_only
     model = DoomPolicy(use_rgb=use_rgb, hidden=ck["config"].get("hidden", 512) if ck else 512).to(device)
     config = {"hidden": model.hidden, "use_rgb": use_rgb, "exclusive_movement": exclusive_movement,
               "weapon_discipline": weapon_discipline, "combat_head_only": combat_only,
-              "collision_aware": collision_aware}
+              "collision_aware": collision_aware, "height_safe_shaping": height_safe_shaping}
     action_stats = exclusive_logp_ent if exclusive_movement else bernoulli_logp_ent
     parameters = combat_parameters(model) if combat_only else model.parameters()
     opt = torch.optim.Adam(parameters, lr=args.lr, eps=1e-5)
@@ -350,7 +355,8 @@ def main():
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
                   args.curiosity, args.progression_only, args.practice_maps,
-                  weapon_discipline, args.loaded_switch_cost, args.arena_maps, collision_aware),
+                  weapon_discipline, args.loaded_switch_cost, args.arena_maps, collision_aware,
+                  height_safe_shaping),
             daemon=True,
         )
         p.start()
