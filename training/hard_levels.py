@@ -10,9 +10,11 @@ Every level is a corridor with side branches built from keycard_map tiles. Diffi
 2. Plus a key room behind a plain door, longer/bent branches, a guard near the exit, more decoys.
 3. Two-key chain (blue door, then red door) with decoys in both halves and ambushes in dead ends.
 
-The demonstration route is found automatically by breadth-first search over (tile, keys held).
-That search is training-time scaffolding for imitate_keycard.py; the evaluated agent never sees
-it (docs/RULES.md section 2).
+The demonstration route is an explorer that does not know where the keys are: it checks side
+branches in order until it holds the key for the next locked door (explore_tiles). An omniscient
+shortest route taught the policy nothing it could see, so it learned to pace the corridor.
+route_tiles (BFS over tile + keys held) still checks that each layout is solvable. Both are
+training-time scaffolding; the evaluated agent never sees them (docs/RULES.md section 2).
 """
 
 from __future__ import annotations
@@ -88,6 +90,8 @@ def generate(rng: np.random.Generator, tier: int) -> list[str]:
 
 
 def valid(layout) -> bool:
+    if explore_tiles(layout) is None:
+        return False
     tiles = {(x, y): t for y, row in enumerate(layout) for x, t in enumerate(row) if t != "#"}
     for (x, y), t in tiles.items():
         if t in DOORS:  # a door must join exactly two opposite tiles
@@ -136,9 +140,92 @@ def route_tiles(layout):
     return None
 
 
-def route_waypoints(layout):
+def _tiles(layout):
+    return {(x, y): t for y, row in enumerate(layout) for x, t in enumerate(row) if t != "#"}
+
+
+def _walk(tiles, a, b, allowed):
+    """Shortest tile path a -> b (inclusive) through `allowed` tiles."""
+    prev, queue = {a: None}, deque([a])
+    while queue:
+        p = queue.popleft()
+        if p == b:
+            out = []
+            while p is not None:
+                out.append(p)
+                p = prev[p]
+            return out[::-1]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (p[0] + dx, p[1] + dy)
+            if n in tiles and n in allowed and n not in prev:
+                prev[n] = p
+                queue.append(n)
+    raise ValueError(f"no path {a} -> {b}")
+
+
+def explore_tiles(layout):
+    """Route of an explorer that does NOT know where the keys are, so the policy can imitate it
+    from what it sees: walk the main corridor from the spawn; at each side branch, while the key
+    for the next locked door is still missing, go to the branch's dead end and back; once the key
+    is held, skip the remaining branches and open the door. Repeat after every door, then exit."""
+    tiles = _tiles(layout)
+    start = next(p for p, t in tiles.items() if t == "P")
+    exit_ = next(p for p, t in tiles.items() if t == "E")
+    main_y = start[1]
+    main = {p for p in tiles if p[1] == main_y}
+    held: set[str] = set()
+    path = [start]
+    for column in range(start[0] + 1, exit_[0] + 1):
+        here = (column, main_y)
+        tile = tiles[here]
+        if tile in DOORS and DOOR_LOCKS[tile] and not any(tile in KEY_OPENS[k] for k in held):
+            return None  # the explorer reached a locked door without its key: layout not explorable
+        path.append(here)
+        for dy in (-1, 1):
+            root = (column, main_y + dy)
+            if root not in tiles:
+                continue
+            branch = set(_walk_component(tiles, root, main))
+            keys_here = [p for p in branch if tiles[p] in KEY_THINGS]
+            need = _next_lock(tiles, here, exit_, main_y, held)
+            if need is None:
+                continue  # nothing locked ahead: no reason to explore
+            if held & set(need):
+                continue
+            # explore: to the far end (the key, if this branch has one) and back
+            far = keys_here[0] if keys_here else max(branch, key=lambda p: len(_walk(tiles, here, p, branch | {here})))
+            out = _walk(tiles, here, far, branch | {here})
+            path += out[1:] + out[-2::-1]
+            if keys_here:
+                held.add(tiles[keys_here[0]])
+    return path
+
+
+def _walk_component(tiles, root, main):
+    """Tiles of the side branch that starts at `root` (everything reachable without the main row)."""
+    seen, queue = {root}, deque([root])
+    while queue:
+        p = queue.popleft()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (p[0] + dx, p[1] + dy)
+            if n in tiles and n not in main and n not in seen:
+                seen.add(n)
+                queue.append(n)
+    return seen
+
+
+def _next_lock(tiles, here, exit_, main_y, held):
+    """Key tiles that open the next locked door east of `here` on the main corridor (None if none)."""
+    for column in range(here[0] + 1, exit_[0]):
+        t = tiles[(column, main_y)]
+        if t in DOORS and DOOR_LOCKS[t]:
+            return [k for k, doors in KEY_OPENS.items() if t in doors]
+    return None
+
+
+def route_waypoints(layout, path=None):
     """Waypoints in imitate_keycard's format: ((x, y), purpose[, door sector])."""
-    path = route_tiles(layout)
+    path = path or route_tiles(layout)
     tiles = {(x, y): t for y, row in enumerate(layout) for x, t in enumerate(row) if t != "#"}
     sectors = sector_index(layout)
     out = []
@@ -152,7 +239,8 @@ def route_waypoints(layout):
             out.append((((bx + px) / 2, (by + py) / 2), "door", sectors[point]))
         nxt = path[i + 1] if i + 1 < len(path) else None
         turning = nxt is not None and (nxt[0] - point[0], nxt[1] - point[1]) != (point[0] - before[0], point[1] - before[1])
-        if turning or tile in KEY_THINGS or nxt is None or tile in DOORS:
+        dead_end = nxt is not None and nxt == before
+        if turning or dead_end or tile in KEY_THINGS or nxt is None or tile in DOORS:
             out.append((cell_center(point), "walk"))
     ex, ey = cell_center(path[-1])
     out.append((((path[-1][0] + 1) * CELL, ey), "exit"))
@@ -172,7 +260,7 @@ def build_hard_map(directory: Path, index: int, tier: int, seed: int = 0):
     offset = (int(rng.integers(-20, 21)), int(rng.integers(-20, 21)))
     path = directory / f"hard_t{tier}_{index:02d}.wad"
     write_keycard_map(path, layout, angle, offset)
-    return path, route_waypoints(layout), layout
+    return path, route_waypoints(layout, explore_tiles(layout)), layout
 
 
 def build_hard_set(directory: Path, count: int, seed: int = 0):
