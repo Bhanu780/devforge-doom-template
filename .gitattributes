@@ -1,7 +1,5 @@
 # Model weights go through Git LFS (see docs/SUBMISSION.md)
 *.pt filter=lfs diff=lfs merge=lfs -text
-# This 6.8 MB submission file is stored directly because GitHub blocks new LFS uploads to this public fork.
-submission/weights/policy.pt -filter -diff -merge -text
 *.pth filter=lfs diff=lfs merge=lfs -text
 *.safetensors filter=lfs diff=lfs merge=lfs -text
 *.ckpt filter=lfs diff=lfs merge=lfs -text
