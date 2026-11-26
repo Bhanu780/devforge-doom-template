@@ -16,7 +16,13 @@ LAYOUT = (
 CELL = 128
 
 
-def write_keycard_map(path: Path) -> None:
+def cell_center(point: tuple[int, int]) -> tuple[float, float]:
+    x, y = point
+    return (x + 0.5) * CELL, -(y + 0.5) * CELL
+
+
+def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
+                      spawn_offset: tuple[int, int] = (0, 0)) -> None:
     blocks = ['namespace = "zdoom";']
     vertices = {}
 
@@ -29,7 +35,7 @@ def write_keycard_map(path: Path) -> None:
             add("vertex", x=point[0] * CELL, y=-point[1] * CELL)
         return vertices[point]
 
-    tiles = {(x, y): tile for y, row in enumerate(LAYOUT) for x, tile in enumerate(row) if tile != "#"}
+    tiles = {(x, y): tile for y, row in enumerate(layout) for x, tile in enumerate(row) if tile != "#"}
     sectors = {point: index for index, point in enumerate(tiles)}
     sides = 0
 
@@ -44,8 +50,12 @@ def write_keycard_map(path: Path) -> None:
         add("sector", heightfloor=0, heightceiling=0 if tile == "+" else 128,
             texturefloor="FLOOR4_8", textureceiling="CEIL3_5", lightlevel=192)
         if tile in ("P", "K"):
-            add("thing", x=(x + 0.5) * CELL, y=-(y + 0.5) * CELL,
-                angle=0, type=1 if tile == "P" else 13,
+            px, py = cell_center((x, y))
+            if tile == "P":
+                px += spawn_offset[0]
+                py += spawn_offset[1]
+            add("thing", x=px, y=py, angle=spawn_angle if tile == "P" else 0,
+                type=1 if tile == "P" else 13,
                 skill1=True, skill2=True, skill3=True, skill4=True, skill5=True, single=True)
 
     for point, tile in tiles.items():

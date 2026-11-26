@@ -107,3 +107,19 @@ python training/bench.py --wad training/runs/keycard_holdout.wad --seeds 4 --pro
 
 This layout is outside the training map pool. Keep it out of `training/extra_maps/`
 when measuring generalization.
+
+## Automatic side-room training
+
+The imitation trainer generates six practice layouts with four starts each. A
+training-only controller collects demonstrations using the engine state. The
+neural policy fits the demonstrated buttons from the same observations it gets
+at evaluation. Omit `--init` to train from fresh weights. For PPO fine-tuning,
+pass only the generated practice directory.
+Keep the reserved side-room WAD outside that directory.
+
+```bash
+python training/imitate_keycard.py --init training/runs/balanced_progression/candidate.pt
+python training/train.py --run keycard_imitation --export --export-path training/runs/keycard_imitation/candidate.pt
+python training/bench.py --weights training/runs/keycard_imitation/candidate.pt --wad training/runs/keycard_holdout.wad --seeds 4 --procs 2 --ticks 2100
+python training/train.py --run keycard_imitation --resume --practice-maps training/runs/keycard_imitation/maps --workers 2 --episodes-per-map 1 --max-updates 24 --save-every 12
+```

@@ -35,9 +35,9 @@ def _maps_in(wad: Path) -> list[str]:
         return []
 
 
-def build_pool(split: str = "train") -> list[tuple[str, str, str]]:
+def build_pool(split: str = "train", practice_maps: Path | None = None) -> list[tuple[str, str, str]]:
     if split == "progression":
-        return [entry for entry in build_pool("train") if entry[2] == "progression"]
+        return [entry for entry in build_pool("train", practice_maps) if entry[2] == "progression"]
     pool: list[tuple[str, str, str]] = []
     for m in _maps_in(FREEDOOM2):
         held = m in HELDOUT_FREEDOOM
@@ -55,6 +55,9 @@ def build_pool(split: str = "train") -> list[tuple[str, str, str]]:
                 # The hashed public fixture is the red-key / locked-door exit corridor.
                 group = "progression" if wad.name in {"two_rooms.wad", "e7ab54fb6834ffa3.wad"} else "small"
                 pool.append((str(wad), m, group))
+        if practice_maps is not None:
+            for wad in sorted(practice_maps.glob("*.wad")):
+                pool.extend((str(wad), m, "progression") for m in _maps_in(wad))
         if EXTRA_DIR.exists():
             for wad in sorted(EXTRA_DIR.glob("*.wad")):
                 for m in _maps_in(wad):
