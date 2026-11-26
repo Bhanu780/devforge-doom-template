@@ -56,6 +56,10 @@ ENT_HEALTH = 5
 # stall + bump + jitter + revisit together never cost more than this per episode. Uncapped, ~200 stuck steps
 # would cost more than dying (-8), and the cheapest way out of a dead end would be suicide.
 MOVE_PENALTY_CAP = 4.0
+# Revisits get their own budget. Sharing MOVE_PENALTY_CAP let stall/bump/jitter use it up, after which
+# walking loops cost nothing while the curiosity bonus still paid for re-entries: the bot circled between doors.
+# 4.0 + 3.0 = 7.0 stays below the death penalty (8).
+REVISIT_CAP = 3.0
 
 
 class Shaper:
@@ -80,6 +84,7 @@ class Shaper:
         self.prev_armor = None
         self.health_d = math.inf
         self.move_pen = 0.0
+        self.revisit_pen = 0.0
 
     def _exit_distance(self, s) -> float:
         if self.nav is None:
@@ -171,7 +176,9 @@ class Shaper:
             self.last_cell = c
             n = self.entries[c] = self.entries.get(c, 0) + 1
             if n > 2:  # third and later entries: walking the same cleared ground again
-                r += self._move_penalty(R["revisit"] * min(n - 2, 4))
+                x = max(R["revisit"] * min(n - 2, 4), -(REVISIT_CAP - self.revisit_pen))
+                self.revisit_pen -= x
+                r += x
                 st["revisits"] = st.get("revisits", 0) + 1
         if len(self.door_ids) and not terminated:
             now = self._open(s)
