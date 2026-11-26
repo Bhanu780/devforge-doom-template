@@ -109,6 +109,8 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
             return 0.0
         last_cell[0] = key
         entries[key] = entries.get(key, 0) + 1
+        if entries[key] > 2:  # no novelty pay for walking the same loop again (it rewarded circling)
+            return 0.0
         return curiosity / math.sqrt(entries[key])
 
     obs = new_episode()
@@ -546,11 +548,10 @@ def main():
                   "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": config}
             torch.save(ck, run_dir / "latest.tmp")
             os.replace(run_dir / "latest.tmp", latest)
-            snapshot = run_dir / f"policy_{env_steps:09d}.pt"
-            torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
-                        "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
-                       snapshot.with_suffix(".tmp"))
-            os.replace(snapshot.with_suffix(".tmp"), snapshot)
+            if update % (args.save_every * 5) == 0:
+                torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
+                            "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
+                           run_dir / f"policy_{env_steps / 1e6:05.2f}M.pt")
             log_f.flush()
 
     for c in conns:
