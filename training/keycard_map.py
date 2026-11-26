@@ -22,7 +22,10 @@ BENT_LAYOUT = (
     "##########",
 )
 CELL = 128
-THING_TYPES = {"P": 1, "K": 13, "Z": 3004, "I": 3001}
+THING_TYPES = {
+    "P": 1, "K": 13, "Z": 3004, "I": 3001,
+    "S": 2001, "A": 2008, "H": 2012, "G": 9,
+}
 
 
 def cell_center(point: tuple[int, int]) -> tuple[float, float]:

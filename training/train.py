@@ -41,7 +41,7 @@ ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
            curiosity: float, progression_only: bool, practice_maps: Path | None,
-           weapon_discipline: bool, loaded_switch_cost: float):
+           weapon_discipline: bool, loaded_switch_cost: float, arena_maps: Path | None):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -52,7 +52,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     from rewards import Shaper
 
     rng = np.random.default_rng(seed)
-    pool = maps.build_pool("progression" if progression_only else "train", practice_maps)
+    pool = maps.build_pool("progression" if progression_only else "train", practice_maps, arena_maps)
     map_index = idx
     env, fb, shaper = None, FeatureBuilder(), Shaper(weapon_discipline, loaded_switch_cost)
     env_steps, eps_left, cur = 0, 0, None
@@ -202,6 +202,7 @@ def main():
     ap.add_argument("--episodes-per-map", type=int, default=3)
     ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--practice-maps", type=Path, help="add generated WADs to the progression curriculum")
+    ap.add_argument("--arena-maps", type=Path, help="add generated combat arenas to the map pool")
     ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
     ap.add_argument("--combat-head-only", action=argparse.BooleanOptionalAction, default=None,
                     help="fine-tune attack and weapon outputs plus the critic")
@@ -222,6 +223,10 @@ def main():
         ap.error("--combat-head-only needs a trained checkpoint via --resume")
     if args.practice_maps is not None and not any(args.practice_maps.glob("*.wad")):
         ap.error("--practice-maps must contain at least one WAD")
+    if args.arena_maps is not None and not any(args.arena_maps.glob("*.wad")):
+        ap.error("--arena-maps must contain at least one WAD")
+    if args.progression_only and args.arena_maps is not None:
+        ap.error("--arena-maps requires the mixed curriculum")
     if args.episodes_per_map < 1:
         ap.error("--episodes-per-map must be positive")
     if args.workers < 1 or args.chunk < 1 or args.steps < 1 or args.steps % args.chunk:
@@ -281,7 +286,7 @@ def main():
         p = ctx.Process(
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
-                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline, args.loaded_switch_cost),
+                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline, args.loaded_switch_cost, args.arena_maps),
             daemon=True,
         )
         p.start()

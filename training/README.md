@@ -220,3 +220,31 @@ weapon-selection rows and the value head. A fresh optimizer is created on the
 first combat-only resume. Use `--no-combat-head-only` to resume full-policy
 training with a fresh optimizer. Use `--loaded-switch-cost` to compare different
 training penalties for cycling away from a loaded weapon under threat.
+
+## Vary combat layouts and starting conditions
+
+Generate combat practice separately from the arena benchmark. Practice covers
+open rooms, pillars, chokepoints, and alternate routes, with four spawn
+configurations per layout. The validation layouts use different cover and
+enemy placements.
+
+```bash
+python training/combat_maps.py training/runs/arenas_train
+python training/combat_maps.py training/runs/arenas_val --split val
+```
+
+Pass only `training/runs/arenas_train` to `train.py --arena-maps`. Combine it
+with the existing keycard practice maps and bundled Freedoom training levels:
+
+```bash
+DOOM_GROUPS=arena=0.35,progression=0.35,small=0.10,fd_early=0.10,fd=0.10 \
+  python training/train.py --run arenas_combat_only --resume --weapon-discipline \
+  --combat-head-only --arena-maps training/runs/arenas_train \
+  --practice-maps training/runs/keycard_combat_maps \
+  --workers 2 --episodes-per-map 1 --steps 128 --chunk 16 --epochs 2 --lr 0.0001 \
+  --loaded-switch-cost 0.08 --ent 0.01 --ent-final 0.01 --curiosity 0.015 --max-updates 48 --save-every 8
+```
+
+Seed each comparison run with a separate copy of the same starting checkpoint.
+Use `--no-combat-head-only` for the full-policy comparison. Evaluate candidates
+on the same reserved arenas, keycard layouts, and Freedoom maps.

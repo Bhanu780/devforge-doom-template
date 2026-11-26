@@ -35,9 +35,9 @@ def _maps_in(wad: Path) -> list[str]:
         return []
 
 
-def build_pool(split: str = "train", practice_maps: Path | None = None) -> list[tuple[str, str, str]]:
+def build_pool(split: str = "train", practice_maps: Path | None = None, arena_maps: Path | None = None) -> list[tuple[str, str, str]]:
     if split == "progression":
-        return [entry for entry in build_pool("train", practice_maps) if entry[2] == "progression"]
+        return [entry for entry in build_pool("train", practice_maps, arena_maps) if entry[2] == "progression"]
     pool: list[tuple[str, str, str]] = []
     for m in _maps_in(FREEDOOM2):
         held = m in HELDOUT_FREEDOOM
@@ -58,6 +58,9 @@ def build_pool(split: str = "train", practice_maps: Path | None = None) -> list[
         if practice_maps is not None:
             for wad in sorted(practice_maps.glob("*.wad")):
                 pool.extend((str(wad), m, "progression") for m in _maps_in(wad))
+        if arena_maps is not None:
+            for wad in sorted(arena_maps.glob("*.wad")):
+                pool.extend((str(wad), m, "arena") for m in _maps_in(wad))
         if EXTRA_DIR.exists():
             for wad in sorted(EXTRA_DIR.glob("*.wad")):
                 for m in _maps_in(wad):
@@ -71,10 +74,10 @@ def group_weights(env_steps: int) -> dict[str, float]:
     if override:
         return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
     if env_steps < 3_000_000:
-        return {"progression": 0.20, "small": 0.4, "fd_early": 0.4, "fd": 0.0}
+        return {"arena": 0.30, "progression": 0.20, "small": 0.4, "fd_early": 0.4, "fd": 0.0}
     if env_steps < 8_000_000:
-        return {"progression": 0.10, "small": 0.25, "fd_early": 0.35, "fd": 0.3}
-    return {"progression": 0.05, "small": 0.20, "fd_early": 0.25, "fd": 0.5}
+        return {"arena": 0.30, "progression": 0.10, "small": 0.25, "fd_early": 0.35, "fd": 0.3}
+    return {"arena": 0.30, "progression": 0.05, "small": 0.20, "fd_early": 0.25, "fd": 0.5}
 
 
 def sample(pool, env_steps: int, rng: np.random.Generator):
