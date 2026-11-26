@@ -110,8 +110,9 @@ when measuring generalization.
 
 ## Automatic side-room training
 
-The imitation trainer generates six practice layouts with four starts each. A
-training-only controller collects demonstrations using the engine state. The
+The imitation trainer generates twelve side-room layouts with four starts each.
+Six layouts have a bend between the junction and the key. A training-only
+controller collects demonstrations using the engine state. The
 neural policy fits the demonstrated buttons from the same observations it gets
 at evaluation. Omit `--init` to train from fresh weights. For PPO fine-tuning,
 pass only the generated practice directory.
@@ -123,3 +124,18 @@ python training/train.py --run keycard_imitation --export --export-path training
 python training/bench.py --weights training/runs/keycard_imitation/candidate.pt --wad training/runs/keycard_holdout.wad --seeds 4 --procs 2 --ticks 2100
 python training/train.py --run keycard_imitation --resume --practice-maps training/runs/keycard_imitation/maps --workers 2 --episodes-per-map 1 --max-updates 24 --save-every 12
 ```
+
+To retain combat behavior while fitting the keycard routes, collect additional
+action-probability targets from an earlier policy on the bundled training combat
+scenarios. The targets are interleaved with the navigation demonstrations.
+
+```bash
+python training/imitate_keycard.py --run keycard_bends --epochs 10 \
+  --init training/runs/keycard_ppo/candidate.pt \
+  --combat-reference training/runs/balanced_progression/candidate.pt
+python training/train.py --run keycard_bends --export --export-path training/runs/keycard_bends/candidate.pt
+python training/bench.py --weights training/runs/keycard_bends/candidate.pt --seeds 2 --procs 2 --ticks 2100
+```
+
+Use the same checkpoint, seed list, and tick cap when comparing navigation maps
+and combat scenarios. The held-out suite measures transfer between layouts.

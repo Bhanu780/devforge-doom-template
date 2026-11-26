@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from doom_env import make_env
 from keycard_curriculum import PRACTICE_LAYOUTS, build_practice_map
+from maps import build_pool
 from train import DoomPolicy, FeatureBuilder, ROOT, RunningStd, stack, to_torch
 
 
@@ -62,23 +63,65 @@ def collect_episode(path, route, seed, use_rgb):
     return None
 
 
+@torch.inference_mode()
+def collect_combat(reference, seed, device):
+    """Keep examples of the previous policy's combat actions on training maps."""
+    scenarios = {"basic", "defend_the_center", "deadly_corridor", "rocket_basic"}
+    episodes = []
+    for wad, map_name, _ in build_pool("train"):
+        if Path(wad).stem not in scenarios:
+            continue
+        with closing(make_env(wad, map_name, episode_ticks=768, render_buffers=reference.use_rgb)) as env:
+            for offset in range(2):
+                observation, _ = env.reset(seed=seed + offset)
+                features = FeatureBuilder()
+                features.reset()
+                hidden = reference.initial_state(1, device)
+                inputs, actions = [], []
+                while True:
+                    frame = features.step(observation)
+                    batch = to_torch({key: value[None, None] for key, value in frame.items()}, device)
+                    logits, _, hidden = reference(batch, hidden)
+                    probabilities = logits[0, 0].sigmoid()
+                    action = torch.bernoulli(probabilities).cpu().numpy().astype(np.int8)
+                    inputs.append(frame)
+                    actions.append(probabilities.cpu().numpy())
+                    features.note_action(action)
+                    observation, _, terminated, truncated, _ = env.step(action)
+                    if terminated or truncated:
+                        break
+                episodes.append((stack(inputs), np.asarray(actions, dtype=np.float32)))
+    return episodes
+
+
 def fit(model, episodes, rng, epochs, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    batch_size, chunk_size = 6, 32
     for epoch in range(epochs):
         losses = []
-        for index in rng.permutation(len(episodes)):
-            observations, actions = episodes[index]
-            hidden = model.initial_state(1, device)
-            for start in range(0, len(actions), 24):
-                batch = slice(start, start + 24)
-                inputs = to_torch({k: v[batch, None] for k, v in observations.items()}, device)
-                target = torch.from_numpy(actions[batch]).to(device)
-                logits, _, hidden = model(inputs, hidden)
+        order = rng.permutation(len(episodes))
+        for group_start in range(0, len(order), batch_size):
+            group = [episodes[index] for index in order[group_start:group_start + batch_size]]
+            hidden = model.initial_state(len(group), device)
+            for start in range(0, max(len(actions) for _, actions in group), chunk_size):
+                lengths = [max(0, min(chunk_size, len(actions) - start)) for _, actions in group]
+                size = max(lengths)
+                mask = torch.arange(size, device=device)[:, None] < torch.tensor(lengths, device=device)
+                observations = group[0][0]
+                batch = {name: np.zeros((size, len(group), *values.shape[1:]), dtype=values.dtype)
+                         for name, values in observations.items()}
+                targets = np.zeros((size, len(group), 9), dtype=np.float32)
+                for index, ((frames, actions), length) in enumerate(zip(group, lengths)):
+                    for name in batch:
+                        batch[name][:length, index] = frames[name][start:start + length]
+                    targets[:length, index] = actions[start:start + length]
+                target = torch.from_numpy(targets).to(device)
+                logits, _, hidden = model(to_torch(batch, device), hidden)
                 hidden = hidden.detach()
-                # Use is rare. Give successful door and exit presses extra weight.
+                # Use is rare. Give the demonstrated door and exit presses extra weight.
                 weight = torch.ones_like(target)
-                weight[:, 7] += 4 * target[:, 7]
-                loss = F.binary_cross_entropy_with_logits(logits[:, 0], target, weight=weight)
+                weight[:, :, 7] += 4 * (target[:, :, 7] == 1)
+                loss = F.binary_cross_entropy_with_logits(logits[mask], target[mask], weight=weight[mask])
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -91,6 +134,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", default="keycard_imitation")
     parser.add_argument("--init", type=Path, help="optional initial policy checkpoint")
+    parser.add_argument("--combat-reference", type=Path, help="retain examples from a prior combat policy")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -117,6 +161,15 @@ def main():
         print(f"layout {layout}: {successes}/4 completed demonstrations", flush=True)
     if not episodes:
         raise RuntimeError("No completed demonstrations; check the practice maps and waypoint route")
+    if args.combat_reference:
+        prior = torch.load(args.combat_reference, map_location="cpu", weights_only=True)
+        if prior["config"]["use_rgb"] != model.use_rgb:
+            parser.error("--combat-reference must use the same RGB setting as the initial policy")
+        reference = DoomPolicy(**prior["config"]).to(device)
+        reference.load_state_dict(prior["model"])
+        combat = collect_combat(reference.eval(), args.seed, device)
+        print(f"adding {len(combat)} combat episodes from the reference policy", flush=True)
+        episodes.extend(combat)
     print(f"training on {len(episodes)} episodes, {sum(len(actions) for _, actions in episodes)} decisions", flush=True)
     fit(model, episodes, rng, args.epochs, device)
 
