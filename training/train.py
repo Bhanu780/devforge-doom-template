@@ -112,12 +112,13 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
 
     obs = new_episode()
     feats = fb.step(obs)
-    conn.send((feats, 0.0, True, None, None))
+    conn.send((feats, 0.0, True, None, None, 0.0))
     while True:
         msg = conn.recv()
         if msg is None:
             break
         action, env_steps = msg
+        t_work = time.perf_counter()
         fb.note_action(action)
         obs, _, term, trunc, _ = env.step(action)
         r = shaper.step(env, action, obs, term or trunc)
@@ -129,12 +130,12 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
             final = fb.step(obs) if (trunc and not term) else None
             obs = new_episode()
             feats = fb.step(obs)
-            conn.send((feats, r, True, info, final))
+            conn.send((feats, r, True, info, final, time.perf_counter() - t_work))
         else:
             feats = fb.step(obs)
             bonus = curiosity_bonus() if curiosity > 0 else 0.0
             shaper.stats["intrinsic"] = shaper.stats.get("intrinsic", 0.0) + bonus
-            conn.send((feats, r + bonus, False, info, None))
+            conn.send((feats, r + bonus, False, info, None, time.perf_counter() - t_work))
     if env is not None:
         env.close()
 
@@ -295,7 +296,9 @@ def main():
         firsts = np.zeros((T + 1, N), np.float32)
         h_chunks = []
         model.eval()
+        t_policy = t_wait = t_work_max = t_work_mean = 0.0
         for t in range(T):
+            t_a = time.perf_counter()
             if t % args.chunk == 0:
                 h_chunks.append(h.clone())
             for k in ALL_KEYS:
@@ -312,9 +315,16 @@ def main():
             acts[t] = a_np
             logps[t] = lp.cpu().numpy()
             vals[t] = v[0].cpu().numpy()
+            t_b = time.perf_counter()
             for i, c in enumerate(conns):
                 c.send((a_np[i], env_steps))
             res = [c.recv() for c in conns]
+            t_c = time.perf_counter()
+            t_policy += t_b - t_a
+            t_wait += t_c - t_b
+            works = [r[5] for r in res]
+            t_work_max += max(works)
+            t_work_mean += sum(works) / len(works)
             cur = stack([r[0] for r in res])
             rews[t] = [r[1] for r in res]
             cur_first = np.array([r[2] for r in res], np.float32)
@@ -407,6 +417,10 @@ def main():
             m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic", "fists", "prog")}
         else:
             m = {}
+        if update % 10 == 1:  # where rollout time goes: policy forward, slowest worker's own work, the rest is IPC/scheduling
+            print(f"  timing per step: policy {1000 * t_policy / T:.1f} ms | wait for workers {1000 * t_wait / T:.1f} ms "
+                  f"(slowest worker's own work {1000 * t_work_max / T:.1f} ms, average {1000 * t_work_mean / T:.1f} ms, "
+                  f"so ~{1000 * (t_wait - t_work_max) / T:.1f} ms is messaging/CPU contention)", flush=True)
         print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
               f"pg {s[0]:.3f} vf {s[1]:.3f} ent {s[2]:.2f} kl {s[3]:.4f} | "
               + " ".join(f"{k} {v:.2f}" for k, v in m.items()), flush=True)
