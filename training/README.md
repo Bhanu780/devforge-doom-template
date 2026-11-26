@@ -204,3 +204,19 @@ The exported config keeps the mask consistent with PPO's action distribution.
 - [ViZDoom scenarios](https://github.com/Farama-Foundation/ViZDoom/blob/main/docs/environments/default.md) provide distinct combat and exploration practice tasks.
 - [StarNet demos](https://github.com/Trinkle23897/VizDoom2018-Track1) illustrate the combat-to-progression sequences we measure in the mixed maps.
 - [Curiosity-driven exploration](https://github.com/pathak22/noreward-rl) informs the novelty objective. This implementation uses counts from its own memory map.
+
+## Inspect and tune combat independently
+
+Run the held-out benchmark with `--combat-stats` to record decisions with the
+fist selected, out-of-range punches, weapon-switch presses, switches from a
+loaded weapon while an enemy is visible, and hits. The benchmark reads engine
+counters after the policy acts.
+
+To isolate combat learning, copy a completed checkpoint to a new run and add
+`--combat-head-only --weapon-discipline` when resuming the trainer.
+This freezes the observation encoders, recurrent memory, and the actor's
+navigation and interaction output rows. PPO updates the attack and
+weapon-selection rows and the value head. A fresh optimizer is created on the
+first combat-only resume. Use `--no-combat-head-only` to resume full-policy
+training with a fresh optimizer. Use `--loaded-switch-cost` to compare different
+training penalties for cycling away from a loaded weapon under threat.

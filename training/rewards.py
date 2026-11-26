@@ -29,8 +29,9 @@ PLAYER_HEIGHT = 56.0
 
 
 class Shaper:
-    def __init__(self, weapon_discipline: bool = False):
+    def __init__(self, weapon_discipline: bool = False, loaded_switch_cost: float = 0.05):
         self.weapon_discipline = weapon_discipline
+        self.loaded_switch_cost = loaded_switch_cost
 
     def reset(self, env, observation=None) -> None:
         s = env.privileged_state()
@@ -110,7 +111,7 @@ class Shaper:
                     entities = past["visible_entities"]
                     enemy = entities["mask"].astype(bool) & np.isin(entities["entity_type"], (1, 2, 3))
                     if past["vitals"][3] > 0 and enemy.any():
-                        r -= 0.05
+                        r -= self.loaded_switch_cost
             self.prev_switch = switch
             self.prev_observation = obs
         self.prev = s

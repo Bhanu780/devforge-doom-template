@@ -40,7 +40,8 @@ ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
 
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
-           curiosity: float, progression_only: bool, practice_maps: Path | None, weapon_discipline: bool):
+           curiosity: float, progression_only: bool, practice_maps: Path | None,
+           weapon_discipline: bool, loaded_switch_cost: float):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -53,7 +54,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     rng = np.random.default_rng(seed)
     pool = maps.build_pool("progression" if progression_only else "train", practice_maps)
     map_index = idx
-    env, fb, shaper = None, FeatureBuilder(), Shaper(weapon_discipline)
+    env, fb, shaper = None, FeatureBuilder(), Shaper(weapon_discipline, loaded_switch_cost)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -168,6 +169,19 @@ def exclusive_logp_ent(logits, actions):
     return logp + movement.log_prob(choices).sum(-1), entropy + movement.entropy().sum(-1)
 
 
+def combat_parameters(model):
+    """Update attack and next-weapon outputs while keeping the navigation policy fixed."""
+    model.requires_grad_(False)
+    model.v.requires_grad_(True)
+    output = model.pi[-1]
+    output.requires_grad_(True)
+    keep = torch.zeros_like(output.bias)
+    keep[[6, 8]] = 1
+    output.bias.register_hook(lambda gradient: gradient * keep)
+    output.weight.register_hook(lambda gradient: gradient * keep[:, None])
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser()
@@ -189,6 +203,9 @@ def main():
     ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--practice-maps", type=Path, help="add generated WADs to the progression curriculum")
     ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
+    ap.add_argument("--combat-head-only", action=argparse.BooleanOptionalAction, default=None,
+                    help="fine-tune attack and weapon outputs plus the critic")
+    ap.add_argument("--loaded-switch-cost", type=float, default=0.05, help="training penalty for cycling a loaded weapon under fire")
     ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
     ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--no-rgb", action="store_true")
@@ -199,6 +216,10 @@ def main():
     ap.add_argument("--save-every", type=int, default=20)
     args = ap.parse_args()
 
+    if not math.isfinite(args.loaded_switch_cost) or args.loaded_switch_cost < 0:
+        ap.error("--loaded-switch-cost must be finite and nonnegative")
+    if args.combat_head_only and not args.resume:
+        ap.error("--combat-head-only needs a trained checkpoint via --resume")
     if args.practice_maps is not None and not any(args.practice_maps.glob("*.wad")):
         ap.error("--practice-maps must contain at least one WAD")
     if args.episodes_per_map < 1:
@@ -224,17 +245,22 @@ def main():
         use_rgb = ck["config"]["use_rgb"]
         exclusive_movement = exclusive_movement or ck["config"].get("exclusive_movement", False)
         weapon_discipline = weapon_discipline or ck["config"].get("weapon_discipline", False)
+    prior_combat_only = bool(ck and ck["config"].get("combat_head_only", False))
+    combat_only = prior_combat_only if args.combat_head_only is None else args.combat_head_only
     model = DoomPolicy(use_rgb=use_rgb, hidden=ck["config"].get("hidden", 512) if ck else 512).to(device)
     config = {"hidden": model.hidden, "use_rgb": use_rgb, "exclusive_movement": exclusive_movement,
-              "weapon_discipline": weapon_discipline}
+              "weapon_discipline": weapon_discipline, "combat_head_only": combat_only}
     action_stats = exclusive_logp_ent if exclusive_movement else bernoulli_logp_ent
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    parameters = combat_parameters(model) if combat_only else model.parameters()
+    opt = torch.optim.Adam(parameters, lr=args.lr, eps=1e-5)
     ret_std = RunningStd()
     update, env_steps = 0, 0
 
     if ck is not None:
         model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
+        # Optimizer moments from full-policy training could update frozen action rows.
+        if not args.export and combat_only == prior_combat_only:
+            opt.load_state_dict(ck["opt"])
         update, env_steps = ck["update"], ck["env_steps"]
         ret_std.n, ret_std.mean, ret_std.m2 = ck["ret_std"]
         print(f"resumed update {update}, {env_steps / 1e6:.1f}M steps")
@@ -255,7 +281,7 @@ def main():
         p = ctx.Process(
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
-                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline),
+                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline, args.loaded_switch_cost),
             daemon=True,
         )
         p.start()
