@@ -66,6 +66,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="")
     ap.add_argument("--procs", type=int, default=4)
+    ap.add_argument("--wad", type=Path, help="evaluate one local WAD instead of a preset split")
+    ap.add_argument("--map", default="MAP01", help="map name for --wad")
     ap.add_argument("--split", choices=("val", "progression"), default="val")
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--temperature", type=float, help="override policy sampling temperature for diagnostics")
@@ -77,8 +79,9 @@ def main():
     import maps
 
     weights = str(Path(args.weights).resolve()) if args.weights else ""
-    jobs = [(w, m, s, args.ticks, weights, args.temperature)
-            for (w, m, _) in maps.build_pool(args.split) for s in range(args.seeds)]
+    layouts = [(str(args.wad.resolve()), args.map.upper(), "custom")] if args.wad else maps.build_pool(args.split)
+    jobs = [(wad, name, seed, args.ticks, weights, args.temperature)
+            for wad, name, _ in layouts for seed in range(args.seeds)]
     with mp.get_context("spawn").Pool(args.procs) as pool:
         res = pool.map(run_one, jobs)
     keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")
