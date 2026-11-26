@@ -102,10 +102,10 @@ def group_weights(env_steps: int) -> dict[str, float]:
     if override:
         return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
     if env_steps < 3_000_000:
-        return {"arena": 0.30, "progression": 0.15, "hard": 0.15, "small": 0.35, "fd_early": 0.35, "fd": 0.0}
+        return {"arena": 0.25, "progression": 0.15, "hard": 0.15, "small": 0.30, "fd_early": 0.40, "fd": 0.05}
     if env_steps < 8_000_000:
-        return {"arena": 0.30, "progression": 0.08, "hard": 0.17, "small": 0.20, "fd_early": 0.30, "fd": 0.25}
-    return {"arena": 0.30, "progression": 0.05, "hard": 0.15, "small": 0.15, "fd_early": 0.20, "fd": 0.45}
+        return {"arena": 0.20, "progression": 0.08, "hard": 0.15, "small": 0.15, "fd_early": 0.35, "fd": 0.35}
+    return {"arena": 0.15, "progression": 0.05, "hard": 0.12, "small": 0.10, "fd_early": 0.25, "fd": 0.55}
 
 
 def sample(pool, env_steps: int, rng: np.random.Generator):

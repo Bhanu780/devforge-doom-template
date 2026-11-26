@@ -15,33 +15,34 @@ import navfield
 
 R = dict(
     exit=20.0,
-    exit_health=0.05,  # per remaining HP at exit
+    exit_health=0.08,  # per remaining HP at exit (was 0.05: incentivize safer play to arrive healthier)
     key=5.0,
     door=1.0,
     locked_door=4.0,
-    cell=0.15,  # new 128x128-unit area visited (was 0.1)
+    cell=0.20,  # new 128x128-unit area visited (was 0.15: stronger exploration drive for large Freedoom maps)
     revisit=-0.03,  # per entry into a 128-unit area already entered twice, x min(entries - 2, 4): stops backtracking loops
     kill=0.3,  # was 1.0: 20-40 kills per map out-paid the exit, so the bot farmed fights
-    damage=-0.03,  # per HP lost, x (1 + 2 * missing-health fraction): 0.03/HP at full health, ~0.07/HP below 40 HP
-    death=-8.0,  # was -5: dying early also costs the scorer's survival points
-    health_gain=0.04,  # per HP healed, x (1 + 2 * missing-health fraction before the pickup); medkits never moved items
-    armor_gain=0.01,  # per armour point picked up
-    seek_health=0.002,  # below SEEK_HP: per map unit closer to the nearest visible health pickup (clipped per step)
-    under_fire_strafe=0.004,  # per step strafing while hit in the last UNDER_FIRE steps (dodging instead of face-tanking)
+    damage=-0.04,  # per HP lost (was -0.03: penalize taking damage more to reduce 54% death rate)
+    death=-10.0,  # was -8: dying early costs the scorer's survival points AND all further progression
+    health_gain=0.05,  # per HP healed (was 0.04: picking up health matters more with higher damage penalty)
+    armor_gain=0.015,  # per armour point picked up (was 0.01)
+    seek_health=0.003,  # below SEEK_HP: per map unit closer to the nearest visible health pickup (was 0.002)
+    under_fire_strafe=0.005,  # per step strafing while hit (was 0.004: dodging is critical for survival)
     item=0.1,
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
-    attack_no_target=-0.02,  # ATTACK with no enemy near the crosshair (was -0.003: the bot emptied its pistol into walls)
+    use_reverse_door=-0.25,  # pressing USE on an already-opening door reverses it in Doom
+    attack_no_target=-0.02,  # ATTACK with no enemy near the crosshair
+    pistol_spread=-0.015,  # holding continuous fire on pistol spreads shots and lowers accuracy
     ammo_wasted=-0.05,  # per round of ammo spent while no enemy is visible at all
-    stall=-0.02,  # per step while the player has moved < STALL_DIST units over the last STALL_STEPS steps
+    stall=-0.025,  # per step while the player has moved < STALL_DIST units (was -0.02: punish standing still harder)
     hit_damage=0.008,  # credit landed damage while keeping exits more valuable
-    fists_with_ammo=-0.03,  # per step on fists while bullets or shells remain (was fists_vs_far, only for distant enemies)
-    bump=-0.01,  # per step holding FORWARD but moving < BUMP_DIST (stairs, angled walls), no enemy in view
-    jitter=-0.01,  # turn direction reversed from the previous step with no enemy in view (wall-scrape dithering)
+    fists_with_ammo=-0.03,  # per step on fists while bullets or shells remain
+    bump=-0.012,  # per step holding FORWARD but moving < BUMP_DIST (was -0.01)
+    jitter=-0.012,  # turn direction reversed from the previous step with no enemy in view (was -0.01)
     # Potential-based shaping on walking distance to the exit (through missing keys), see navfield.py:
-    # +k per map unit closer, -k per unit farther, 0 standing still; telescopes, so loops can't farm it.
-    exit_dist=0.002,
-    exit_dist_clip=0.5,  # per step; teleports and unmodelled lifts make the distance jump
+    exit_dist=0.003,  # (was 0.002: stronger pull toward exits for bigger Freedoom maps)
+    exit_dist_clip=0.6,  # per step; teleports and unmodelled lifts make the distance jump (was 0.5)
 )
 ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
 SLOT_MELEE = 1  # vitals[2]: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...
@@ -81,6 +82,8 @@ class Shaper:
         self.door_open = self._open(s)  # doors already open at spawn don't count
         self.door_ever = self.door_open.copy()
         self.prev_use = False
+        self.prev_door_opening = False
+        self.prev_attack = False
         self.prev_switch = False
         self.prev_observation = observation
         if self.weapon_discipline:
@@ -228,12 +231,19 @@ class Shaper:
                 st["locked"] += int(locked.sum())
                 self.door_ever |= now
         use = bool(action[7])
-        if use and not self.prev_use and not s["exit_reached"] and not self._gate_ahead(before):
-            r += R["use_press"]
+        near_exit = self.nav is not None and self.d < 96.0
+        if use and not self.prev_use and not s["exit_reached"]:
+            if self.prev_door_opening and self._gate_ahead(before):
+                r += R["use_reverse_door"]
+            elif not self._gate_ahead(before) and not near_exit:
+                r += R["use_press"]
         self.prev_use = use
         aimed = self._shot_on_target(before) if self.recovery_feedback else self._enemy_in_sights(before)
         if action[6] and not landed and not aimed:
             r += R["attack_no_target"]
+        if bool(action[6]) and self.prev_attack and int(before["vitals"][2]) == 2 and not landed:
+            r += R["pistol_spread"]
+        self.prev_attack = bool(action[6])
         if self.weapon_discipline:
             switch = bool(action[8])
             if switch and not self.prev_switch:
@@ -274,6 +284,7 @@ class Shaper:
         # turning left/right at one sign). Potential shaping and curiosity pay 0 there, so it needs a cost.
         opening = bool(self.door_ids.size and not terminated and
                        np.any(s["sector_ceiling"][self.door_ids] > p["sector_ceiling"][self.door_ids]))
+        self.prev_door_opening = opening
         self.trail.append((s["x"], s["y"]))
         if len(self.trail) > STALL_STEPS:
             self.trail.pop(0)
