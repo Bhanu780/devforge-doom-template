@@ -139,3 +139,26 @@ python training/bench.py --weights training/runs/keycard_bends/candidate.pt --se
 
 Use the same checkpoint, seed list, and tick cap when comparing navigation maps
 and combat scenarios. The held-out suite measures transfer between layouts.
+
+## Harder generated levels
+
+`training/hard_levels.py` generates random corridor levels in three tiers: decoy dead-ends with a
+hidden red key (1); plus a key room behind a plain door, longer bent branches and guards (2); a
+blue-then-red two-key chain with ambushes in dead ends (3). The demonstration route is found by a
+training-only BFS over (tile, keys held). `--check` plays every level with the demonstration
+controller to prove it can be completed.
+
+```bash
+python training/hard_levels.py training/runs/hard_maps --count 36 --check
+python training/imitate_keycard.py --run hard --hard-levels 36 --init training/runs/keycard_bends/candidate.pt
+python training/train.py --run hard --resume --practice-maps training/runs/hard_maps --progression-only --episodes-per-map 1
+```
+
+## Weapon handling
+
+`features.action_mask()` masks two buttons from observation fields (allowed by docs/RULES.md §1),
+inside the network so training and evaluation match: SELECT_NEXT_WEAPON while holding a loaded gun
+with no enemy within 96 units (one press from the pistol wraps to the fists), and ATTACK while
+holding fists with no enemy within reach. The shaper adds `fists_vs_far` (-0.02 per step holding
+fists while bullets or shells remain and the nearest visible enemy is out of reach) so the policy
+learns to switch back. Episode logs report it as `fists`.
