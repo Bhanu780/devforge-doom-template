@@ -247,6 +247,9 @@ def main():
         print(f"exported -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
         return
 
+    import maps
+
+    maps.ensure_hard_levels()  # before the workers start, so they never race to write the WADs
     ctx = mp.get_context("spawn")
     conns, procs = [], []
     seed0 = args.seed + env_steps

@@ -96,8 +96,8 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
                 lock = DOOR_LOCKS[other]
                 if lock:  # Door_LockedRaise(tag 0 = back sector, speed, delay, lock)
                     fields.update(special=13, arg1=32, arg2=150, arg3=lock, playeruse=True, repeatspecial=True)
-                else:  # Door_Raise(tag 0 = back sector, speed, delay)
-                    fields.update(special=12, arg1=32, arg2=150, playeruse=True, repeatspecial=True)
+                else:  # Door_Open(tag 0 = back sector, speed): stays open, so routes that come back through it work
+                    fields.update(special=11, arg1=32, playeruse=True)
             if exit_switch:
                 fields.update(special=243, playeruse=True)
             add("linedef", **fields)

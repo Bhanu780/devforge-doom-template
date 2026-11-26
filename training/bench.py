@@ -48,14 +48,20 @@ def run_one(job):
     agent.reset()
     sh = Shaper()
     sh.reset(env)
+    seen = gun = 0  # steps with an enemy in view, and how many of those had a gun selected
     while True:
         a = agent.act(obs)
+        if sh._enemy_visible(obs):
+            seen += 1
+            gun += int(obs["vitals"][2]) >= 2
         obs, _, te, tu, _ = env.step(a)
         sh.step(env, a, obs, te or tu)
         if te or tu:
             break
     env.close()
     st = dict(sh.stats)
+    st["fists"] = st.get("fists", 0)  # steps holding fists vs an out-of-reach enemy while ammo remained
+    st["gun%"] = 100.0 * gun / seen if seen else 100.0
     st["seed"] = seed
     st["map"] = f"{Path(wad).stem}:{mapname}"
     st["score"] = proxy_score(st)
@@ -68,7 +74,7 @@ def main():
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--wad", type=Path, help="evaluate one local WAD instead of a preset split")
     ap.add_argument("--map", default="MAP01", help="map name for --wad")
-    ap.add_argument("--split", choices=("val", "progression"), default="val")
+    ap.add_argument("--split", choices=("val", "progression", "hard"), default="val")
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--temperature", type=float, help="override policy sampling temperature for diagnostics")
     ap.add_argument("--ticks", type=int, default=4200)
@@ -79,12 +85,14 @@ def main():
     import maps
 
     weights = str(Path(args.weights).resolve()) if args.weights else ""
+    if not args.wad:
+        maps.ensure_hard_levels()
     layouts = [(str(args.wad.resolve()), args.map.upper(), "custom")] if args.wad else maps.build_pool(args.split)
     jobs = [(wad, name, seed, args.ticks, weights, args.temperature)
             for wad, name, _ in layouts for seed in range(args.seeds)]
     with mp.get_context("spawn").Pool(args.procs) as pool:
         res = pool.map(run_one, jobs)
-    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")
+    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "fists", "gun%", "score")
     print(f"{'map':32s} {'seed':>4s} " + " ".join(f"{k:>6s}" for k in keys))
     for r in res:
         print(f"{r['map']:32s} {r['seed']:4d} " + " ".join(f"{r[k]:6.1f}" for k in keys))

@@ -60,6 +60,11 @@ class Shaper:
         return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
 
     @staticmethod
+    def _enemy_visible(obs) -> bool:
+        ent = obs["visible_entities"]
+        return bool(np.any((np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)))
+
+    @staticmethod
     def _fists_vs_far(obs) -> bool:
         vit = np.asarray(obs["vitals"])
         if int(vit[2]) != SLOT_MELEE or (vit[4] <= 0 and vit[5] <= 0):  # no bullets or shells: fists are all we have
