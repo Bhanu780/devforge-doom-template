@@ -1,3 +1,33 @@
+# MapMind: a DOOM agent with path-integrated spatial memory
+
+**Yugaantar 2026 · DevForge · Track 1 "Can It Play DOOM?"**
+
+The agent plays unseen DOOM levels from the official ego-centric observations only. Its distinctive
+part is a **self-built memory map**: the wrapper gives no position or heading, so the agent
+dead-reckons its own pose (Doom's exact turn rule plus player-frame velocity) and draws every step's
+64 raycasts and visible entities into a top-down grid. Walls, doors, locked doors, keys, items,
+enemies and visited cells stay remembered for the whole map, which is what keycard backtracking needs.
+Every action comes from a trained recurrent network; the map only encodes observations.
+
+| Part | Where | What it does |
+| --- | --- | --- |
+| Odometry + memory map | `submission/model/features.py` | Heading from our own turn buttons (1.76 deg/tic for 5 tics, then 3.52), position from velocity, static-scan check when pushing into walls; 8-channel 192x192 grid, 32x32 ahead-up crop for the policy |
+| Policy | `submission/model/policy.py` | Circular 1D conv over rays, masked self-attention over 0-32 entities, map CNN, RGB+depth CNN (exit switches), GRU 512, 9 Bernoulli buttons + value. 3.4 M params, ~2-3 ms/step on 1 CPU thread |
+| Agent | `submission/agent.py` | Loads weights once, clears map + GRU on `reset()`, samples at temperature 0.7, never crashes |
+| Training | `training/train.py` | Our own recurrent PPO (multiprocess envs, GPU learner, truncated BPTT, GAE, return normalisation) |
+| Rewards + curiosity | `training/rewards.py`, `train.py` | Scorer-aligned shaping (exit, keys, doors, locked doors, new areas, kills, damage, death) + intrinsic count-based novelty on the agent's own map |
+| Maps + curriculum | `training/maps.py` | Freedoom 2 MAP01-32, ViZDoom scenarios, test WADs; small maps first, full levels later; 7 maps held out |
+| Benchmark | `training/bench.py` | Runs the real `DoomAgent` on held-out maps and reports exits, keys, doors, coverage, kills |
+
+Measured: heading error 0 deg while alive; position drift 9-63 units after 300 random steps;
+validator step latency p50 1.6 ms (Windows) / 3.2 ms (Linux) against a 40 ms budget.
+
+**Train:** see [training/README.md](training/README.md). **Brief:** [brief/Project_Brief.pdf](brief/Project_Brief.pdf).
+
+---
+
+## Template information (from the official starter)
+
 # devforge-doom-template
 
 Starter template for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
