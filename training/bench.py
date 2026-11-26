@@ -24,7 +24,7 @@ def proxy_score(st) -> float:
 
 
 def run_one(job):
-    wad, mapname, seed, ticks, weights = job
+    wad, mapname, seed, ticks, weights, temperature = job
     import os
     import warnings
 
@@ -42,6 +42,8 @@ def run_one(job):
     env = make_env(wad, mapname, episode_ticks=ticks)
     agent = agent_mod.DoomAgent(env.observation_space, env.action_space, "cpu")
     agent.rng = np.random.default_rng(seed)
+    if temperature is not None:
+        agent.temperature = temperature
     obs, _ = env.reset(seed=seed)
     agent.reset()
     sh = Shaper()
@@ -54,6 +56,7 @@ def run_one(job):
             break
     env.close()
     st = dict(sh.stats)
+    st["seed"] = seed
     st["map"] = f"{Path(wad).stem}:{mapname}"
     st["score"] = proxy_score(st)
     return st
@@ -63,21 +66,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="")
     ap.add_argument("--procs", type=int, default=4)
+    ap.add_argument("--split", choices=("val", "progression"), default="val")
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--temperature", type=float, help="override policy sampling temperature for diagnostics")
     ap.add_argument("--ticks", type=int, default=4200)
     args = ap.parse_args()
+    if args.temperature is not None and not (np.isfinite(args.temperature) and args.temperature > 0):
+        ap.error("--temperature must be positive and finite")
     sys.path.insert(0, str(ROOT / "training"))
     import maps
 
-    jobs = [(w, m, s, args.ticks, str(Path(args.weights).resolve()) if args.weights else "")
-            for (w, m, _) in maps.build_pool("val") for s in range(args.seeds)]
+    weights = str(Path(args.weights).resolve()) if args.weights else ""
+    jobs = [(w, m, s, args.ticks, weights, args.temperature)
+            for (w, m, _) in maps.build_pool(args.split) for s in range(args.seeds)]
     with mp.get_context("spawn").Pool(args.procs) as pool:
         res = pool.map(run_one, jobs)
     keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")
-    print(f"{'map':32s} " + " ".join(f"{k:>6s}" for k in keys))
+    print(f"{'map':32s} {'seed':>4s} " + " ".join(f"{k:>6s}" for k in keys))
     for r in res:
-        print(f"{r['map']:32s} " + " ".join(f"{r[k]:6.1f}" for k in keys))
-    print(f"{'MEAN':32s} " + " ".join(f"{np.mean([r[k] for r in res]):6.1f}" for k in keys))
+        print(f"{r['map']:32s} {r['seed']:4d} " + " ".join(f"{r[k]:6.1f}" for k in keys))
+    print(f"{'MEAN':37s} " + " ".join(f"{np.mean([r[k] for r in res]):6.1f}" for k in keys))
 
 
 if __name__ == "__main__":

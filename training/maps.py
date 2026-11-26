@@ -36,6 +36,8 @@ def _maps_in(wad: Path) -> list[str]:
 
 
 def build_pool(split: str = "train") -> list[tuple[str, str, str]]:
+    if split == "progression":
+        return [entry for entry in build_pool("train") if entry[2] == "progression"]
     pool: list[tuple[str, str, str]] = []
     for m in _maps_in(FREEDOOM2):
         held = m in HELDOUT_FREEDOOM
@@ -50,7 +52,9 @@ def build_pool(split: str = "train") -> list[tuple[str, str, str]]:
     if split == "train":
         for wad in sorted((ROOT / "tests" / "fixtures").glob("*.wad")) + [ROOT / "maps" / "two_rooms.wad"]:
             for m in _maps_in(wad):
-                pool.append((str(wad), m, "small"))
+                # The hashed public fixture is the red-key / locked-door exit corridor.
+                group = "progression" if wad.name in {"two_rooms.wad", "e7ab54fb6834ffa3.wad"} else "small"
+                pool.append((str(wad), m, group))
         if EXTRA_DIR.exists():
             for wad in sorted(EXTRA_DIR.glob("*.wad")):
                 for m in _maps_in(wad):
@@ -64,10 +68,10 @@ def group_weights(env_steps: int) -> dict[str, float]:
     if override:
         return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
     if env_steps < 3_000_000:
-        return {"small": 0.6, "fd_early": 0.4, "fd": 0.0}
+        return {"progression": 0.20, "small": 0.4, "fd_early": 0.4, "fd": 0.0}
     if env_steps < 8_000_000:
-        return {"small": 0.35, "fd_early": 0.35, "fd": 0.3}
-    return {"small": 0.25, "fd_early": 0.25, "fd": 0.5}
+        return {"progression": 0.10, "small": 0.25, "fd_early": 0.35, "fd": 0.3}
+    return {"progression": 0.05, "small": 0.20, "fd_early": 0.25, "fd": 0.5}
 
 
 def sample(pool, env_steps: int, rng: np.random.Generator):

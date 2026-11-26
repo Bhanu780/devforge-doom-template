@@ -38,7 +38,7 @@ ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
 
 
 # ============================================================================ worker
-def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool, curiosity: float):
+def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool, curiosity: float, progression_only: bool):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -49,22 +49,29 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool, curi
     from rewards import Shaper
 
     rng = np.random.default_rng(seed)
-    pool = maps.build_pool("train")
+    pool = maps.build_pool("progression" if progression_only else "train")
+    map_index = idx
     env, fb, shaper = None, FeatureBuilder(), Shaper()
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
     def new_episode():
-        nonlocal env, eps_left, cur
+        nonlocal env, eps_left, cur, map_index
         while True:
             if env is None or eps_left <= 0:
                 if env is not None:
                     env.close()
                     env = None
-                cand = maps.sample(pool, env_steps, rng)
-                if (cand[0], cand[1]) in bad:
-                    continue
-                ticks = int(rng.choice([2100, 2800, 3500, 4200]))
+                available = [entry for entry in pool if entry[:2] not in bad]
+                if not available:
+                    raise RuntimeError("No usable training maps remain")
+                if progression_only:
+                    cand = available[map_index % len(available)]
+                    map_index += 1
+                    ticks = 2100
+                else:
+                    cand = maps.sample(available, env_steps, rng)
+                    ticks = int(rng.choice([2100, 2800, 3500, 4200]))
                 try:
                     env = make_env(cand[0], cand[1], episode_ticks=ticks, render_buffers=use_rgb)
                 except Exception as e:  # unloadable map: skip it forever
@@ -156,6 +163,7 @@ def bernoulli_logp_ent(logits, actions):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="main")
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--steps", type=int, default=128, help="rollout length per worker")
     ap.add_argument("--chunk", type=int, default=32, help="BPTT length")
@@ -169,33 +177,49 @@ def main():
     ap.add_argument("--ent-final", type=float, default=0.01)
     ap.add_argument("--total", type=float, default=60e6, help="env steps for the schedules")
     ap.add_argument("--episodes-per-map", type=int, default=3)
+    ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--curiosity", type=float, default=0.03, help="intrinsic novelty bonus scale (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--export", action="store_true")
+    ap.add_argument("--export-path", type=Path, default=ROOT / "submission" / "weights" / "policy.pt")
     ap.add_argument("--max-updates", type=int, default=10**9)
     ap.add_argument("--save-every", type=int, default=20)
     args = ap.parse_args()
 
+    if args.episodes_per_map < 1:
+        ap.error("--episodes-per-map must be positive")
+    if args.workers < 1 or args.chunk < 1 or args.steps < 1 or args.steps % args.chunk:
+        ap.error("positive workers and steps divisible by a positive chunk are required")
+    if not 1 <= args.minibatches <= args.workers * args.steps // args.chunk:
+        ap.error("each minibatch must contain at least one recurrent sequence")
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     run_dir = ROOT / "training" / "runs" / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_rgb = not args.no_rgb
+    latest = run_dir / "latest.pt"
+    ck = None
+    if args.resume or args.export:
+        if not latest.is_file():
+            ap.error(f"missing trained checkpoint: {latest}")
+        ck = torch.load(latest, map_location=device, weights_only=False)
+        use_rgb = ck["config"]["use_rgb"]
     model = DoomPolicy(use_rgb=use_rgb).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     ret_std = RunningStd()
     update, env_steps = 0, 0
 
-    latest = run_dir / "latest.pt"
-    if (args.resume or args.export) and latest.exists():
-        ck = torch.load(latest, map_location=device, weights_only=False)
+    if ck is not None:
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         update, env_steps = ck["update"], ck["env_steps"]
         ret_std.n, ret_std.mean, ret_std.m2 = ck["ret_std"]
         print(f"resumed update {update}, {env_steps / 1e6:.1f}M steps")
     if args.export:
-        out = ROOT / "submission" / "weights" / "policy.pt"
+        out = args.export_path
+        out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
                     "config": {"hidden": model.hidden, "use_rgb": use_rgb},
                     "meta": {"update": update, "env_steps": env_steps}}, out)
@@ -204,11 +228,12 @@ def main():
 
     ctx = mp.get_context("spawn")
     conns, procs = [], []
-    seed0 = int(time.time()) % 100000
+    seed0 = args.seed + env_steps
     for i in range(args.workers):
         a, b = ctx.Pipe()
-        p = ctx.Process(target=worker, args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb, args.curiosity), daemon=True)
+        p = ctx.Process(target=worker, args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb, args.curiosity, args.progression_only), daemon=True)
         p.start()
+        b.close()
         conns.append(a)
         procs.append(p)
     N, T = args.workers, args.steps
@@ -323,7 +348,7 @@ def main():
                 lp, ent = bernoulli_logp_ent(logits, A[tt_t, ee_t])
                 ratio = torch.exp(lp - LP[tt_t, ee_t])
                 adv_b = ADV[tt_t, ee_t]
-                adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
+                adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
                 pg = -torch.min(ratio * adv_b, ratio.clamp(1 - args.clip, 1 + args.clip) * adv_b).mean()
                 v_old = VOLD[tt_t, ee_t]
                 v_clip = v_old + (v - v_old).clamp(-0.2, 0.2)

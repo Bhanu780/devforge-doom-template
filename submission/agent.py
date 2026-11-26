@@ -29,39 +29,27 @@ class DoomAgent:
         self.device = "cpu"  # a ~3 M parameter net at batch 1 is faster on CPU than via CUDA launches
         self.fb = FeatureBuilder()
         self.rng = np.random.default_rng(0)
-        self.model = None
-        if WEIGHTS.exists():
-            ckpt = torch.load(WEIGHTS, map_location="cpu", weights_only=False)
-            cfg = ckpt.get("config", {})
-            self.model = DoomPolicy(hidden=cfg.get("hidden", 512), use_rgb=cfg.get("use_rgb", True))
-            self.model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
-            self.model.eval()
+        if not WEIGHTS.is_file():
+            raise FileNotFoundError(f"Missing trained policy: {WEIGHTS}")
+        ckpt = torch.load(WEIGHTS, map_location="cpu", weights_only=False)
+        cfg = ckpt.get("config", {})
+        self.model = DoomPolicy(hidden=cfg.get("hidden", 512), use_rgb=cfg.get("use_rgb", True))
+        self.model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
+        self.model.eval()
         self.temperature = TEMPERATURE
         self.reset()
 
     def reset(self) -> None:
         self.fb.reset()
-        self.h = self.model.initial_state(1) if self.model is not None else None
+        self.h = self.model.initial_state(1)
         self.last = np.zeros(9, np.int8)
 
     @torch.no_grad()
     def act(self, observation: dict) -> np.ndarray:
-        try:
-            feats = self.fb.step(observation)
-            if self.model is None:
-                action = np.zeros(9, np.int8)
-            else:
-                x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
-                logits, _, self.h = self.model(x, self.h)
-                p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
-                action = (self.rng.random(9) < p).astype(np.int8)
-            self.fb.note_action(action)
-            self.last = action
-            return action
-        except Exception as e:  # never crash: a crash freezes the player for the rest of the map
-            print(f"[agent] act() error: {e!r}", file=sys.stderr)
-            try:
-                self.fb.note_action(np.zeros(9, np.int8))
-            except Exception:
-                pass
-            return np.zeros(9, np.int8)
+        feats = self.fb.step(observation)
+        x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
+        logits, _, self.h = self.model(x, self.h)
+        p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
+        action = (self.rng.random(9) < p).astype(np.int8)
+        self.fb.note_action(action)
+        return action
