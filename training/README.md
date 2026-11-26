@@ -34,3 +34,62 @@ uv run tensorboard --logdir training/runs                          # watch ep/ex
 - Want more maps? Put any Doom 2 format WAD into `training/extra_maps/` (fewer than 2,048 sectors per map).
 - Throughput is CPU-bound (big Freedoom maps run 100-500 steps/s per core). If the reward curve is flat
   after 1-2 M steps, run with `DOOM_GROUPS="small=1,fd_early=1"` first, then resume without it.
+
+## CPU progression baseline
+
+Activate the project environment and install CPU PyTorch. The following Linux commands
+run a short, seeded experiment with a single engine worker. The progression group
+samples the public two-room map and the public red-key / locked-door fixture.
+These are training layouts. Benchmark on the separate validation pool.
+
+```bash
+source .venv/bin/activate
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 ALSOFT_DRIVERS=null SDL_VIDEODRIVER=dummy
+DOOM_GROUPS=progression=1 python training/train.py --run door_baseline --workers 1 --no-rgb --steps 128 --chunk 16 --epochs 2 --seed 42 --max-updates 32 --save-every 8
+python training/train.py --run door_baseline --export
+python training/bench.py --seeds 2 --procs 1 --ticks 2100
+python validate.py
+```
+
+Compare exits, keys, unlocks, deaths and coverage on identical maps and seeds.
+The printed proxy score uses team-selected weights. To continue training on the
+mixed curriculum, repeat the training command with `--resume`, remove the
+`DOOM_GROUPS` override and increase the absolute update limit. Export restores
+the checkpoint's RGB setting. Archive the current result before exporting a new
+candidate to the same submission path.
+
+Design references: [DeepDoom's door and exit scenarios](https://github.com/Atlas-Soft/DeepDoom#scenarios)
+for the progression curriculum and [CleanRL's recurrent PPO](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_lstm.py)
+for comparison with the team's recurrent sequence handling.
+
+For guaranteed practice on both progression maps, use `--progression-only
+--episodes-per-map 1`. Workers start on staggered maps and cycle to the next map
+after each episode. Export candidates to the run directory so the submission
+checkpoint stays available for comparison.
+
+```bash
+python training/train.py --run balanced_progression --progression-only --episodes-per-map 1 --workers 2 --no-rgb --steps 128 --chunk 16 --epochs 2 --max-updates 48 --save-every 12
+python training/train.py --run balanced_progression --export --export-path training/runs/balanced_progression/candidate.pt
+python training/bench.py --weights training/runs/balanced_progression/candidate.pt --split progression --seeds 4 --procs 2 --ticks 2100
+python training/bench.py --weights training/runs/balanced_progression/candidate.pt --seeds 2 --procs 2 --ticks 2100
+```
+
+The progression benchmark diagnoses key pickups, unlocks, and exits on the two
+practice maps. Use the default validation split to evaluate generalization.
+
+## Play or watch locally
+
+From the repository root, activate the project environment and launch the bundled
+two-room map on a desktop with a display.
+
+```bash
+source .venv/bin/activate
+python training/play.py
+python training/play.py --bot
+python training/play.py --bot --weights training/runs/balanced_progression/candidate.pt
+```
+
+Use W/S to move forward/back, A/D to strafe, left/right arrows to turn, Space to
+shoot, E to use doors and switches, Q to cycle weapons, and Esc to quit.
+Restart the command for another episode. To try a different layout, supply
+`--wad path/to/map.wad --map MAP01`.
