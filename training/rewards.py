@@ -25,7 +25,9 @@ R = dict(
     item=0.1,
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
-    attack_no_target=-0.003,  # ATTACK with no enemy near the crosshair
+    attack_no_target=-0.02,  # ATTACK with no enemy near the crosshair (was -0.003: the bot emptied its pistol into walls)
+    ammo_wasted=-0.05,  # per round of ammo spent while no enemy is visible at all
+    stall=-0.02,  # per step while the player has moved < STALL_DIST units over the last STALL_STEPS steps
     fists_vs_far=-0.02,
     # Potential-based shaping on walking distance to the exit (through missing keys), see navfield.py:
     # +k per map unit closer, -k per unit farther, 0 standing still; telescopes, so loops can't farm it.
@@ -38,6 +40,8 @@ MELEE_RANGE = 96.0  # same as submission/model/features.py
 AIM_SIN = 0.2  # |sin(rel_angle)| below this counts as "near the crosshair" (~11.5 deg)
 CELL = 128.0
 PLAYER_HEIGHT = 56.0
+STALL_STEPS = 16  # ~1.8 s of game time
+STALL_DIST = 48.0  # map units; walking speed covers this in under 2 steps
 
 
 class Shaper:
@@ -53,6 +57,8 @@ class Shaper:
         self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0, prog=0.0)
         self.nav = navfield.for_env(env) if R["exit_dist"] else None
         self.d = self.d0 = self.dmin = self._exit_distance(s)
+        self.trail = [(s["x"], s["y"])]  # recent positions, for the stall penalty
+        self.prev_ammo = None
 
     def _exit_distance(self, s) -> float:
         if self.nav is None:
@@ -143,6 +149,24 @@ class Shaper:
         if self._fists_vs_far(obs):
             r += R["fists_vs_far"]
             st["fists"] = st.get("fists", 0) + 1
+        # Stall: pinned against a wall or jittering in place for ~2 s (the bot spent the last 40 s of a map
+        # turning left/right at one sign). Potential shaping and curiosity pay 0 there, so it needs a cost.
+        self.trail.append((s["x"], s["y"]))
+        if len(self.trail) > STALL_STEPS:
+            self.trail.pop(0)
+            xs, ys = zip(*self.trail)
+            if max(xs) - min(xs) < STALL_DIST and max(ys) - min(ys) < STALL_DIST and not terminated \
+                    and not self._enemy_visible(obs):  # holding position to fight is fine
+                r += R["stall"]
+                st["stall"] = st.get("stall", 0) + 1
+        # Ammo spent with no enemy in view at all (rounds of the selected weapon, from the observation).
+        vit = np.asarray(obs["vitals"])
+        ammo = float(vit[3])
+        if self.prev_ammo is not None and int(vit[2]) == int(self.prev_slot) and ammo < self.prev_ammo \
+                and not self._enemy_visible(obs):
+            r += R["ammo_wasted"] * (self.prev_ammo - ammo)
+            st["wasted"] = st.get("wasted", 0) + int(self.prev_ammo - ammo)
+        self.prev_ammo, self.prev_slot = ammo, vit[2]
         self.prev = s
         st["ret"] += r
         st["steps"] += 1

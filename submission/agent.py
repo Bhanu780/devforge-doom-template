@@ -46,10 +46,17 @@ class DoomAgent:
 
     @torch.no_grad()
     def act(self, observation: dict) -> np.ndarray:
-        feats = self.fb.step(observation)
-        x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
-        logits, _, self.h = self.model(x, self.h)
-        p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
-        action = (self.rng.random(9) < p).astype(np.int8)
-        self.fb.note_action(action)
+        try:
+            feats = self.fb.step(observation)
+            x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
+            logits, _, self.h = self.model(x, self.h)
+            p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
+            action = (self.rng.random(9) < p).astype(np.int8)
+        except Exception as e:  # a crash or invalid action freezes the player for the rest of the map
+            print(f"[agent] act() error: {e!r}", file=sys.stderr)
+            action = np.zeros(9, np.int8)
+        try:
+            self.fb.note_action(action)
+        except Exception:
+            pass
         return action
