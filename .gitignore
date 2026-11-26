@@ -222,3 +222,6 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# Training checkpoints and logs (only the shipped policy goes in submission/weights/)
+training/runs/
