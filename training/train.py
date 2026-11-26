@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT / "training"))
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
-KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map")
+KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map", "act_mask")
 KEYS_INT = ("ray_type", "ent_type")
 KEYS_U8 = ("rgb",)
 ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
@@ -401,7 +401,7 @@ def main():
         s = np.mean(stats, 0)
         sps = N * T / (time.time() - t0)
         if recent:
-            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic")}
+            m = {k: np.mean([e.get(k, 0.0) for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps", "intrinsic", "fists")}
         else:
             m = {}
         print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "

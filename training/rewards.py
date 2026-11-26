@@ -22,8 +22,11 @@ R = dict(
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
     attack_no_target=-0.003,  # ATTACK with no enemy near the crosshair
+    fists_vs_far=-0.02,  # per step holding fists while a gun has ammo and an enemy is out of reach
 )
 ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
+SLOT_MELEE = 1  # vitals[2]: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...
+MELEE_RANGE = 96.0  # same as submission/model/features.py
 AIM_SIN = 0.2  # |sin(rel_angle)| below this counts as "near the crosshair" (~11.5 deg)
 CELL = 128.0
 PLAYER_HEIGHT = 56.0
@@ -55,6 +58,16 @@ class Shaper:
         ent = obs["visible_entities"]
         enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
         return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
+
+    @staticmethod
+    def _fists_vs_far(obs) -> bool:
+        vit = np.asarray(obs["vitals"])
+        if int(vit[2]) != SLOT_MELEE or (vit[4] <= 0 and vit[5] <= 0):  # no bullets or shells: fists are all we have
+            return False
+        ent = obs["visible_entities"]
+        enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
+        d = np.asarray(ent["features"])[enemy, 0] * 1024.0
+        return bool(d.size and d.min() >= MELEE_RANGE)
 
     def step(self, env, action, obs, terminated: bool) -> float:
         s = env.privileged_state()
@@ -97,6 +110,9 @@ class Shaper:
         self.prev_use = use
         if action[6] and not self._enemy_in_sights(obs):
             r += R["attack_no_target"]
+        if self._fists_vs_far(obs):
+            r += R["fists_vs_far"]
+            st["fists"] = st.get("fists", 0) + 1
         self.prev = s
         st["ret"] += r
         st["steps"] += 1

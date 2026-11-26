@@ -119,7 +119,10 @@ class DoomPolicy(nn.Module):
             o, h = self.gru(z[t:t + 1], h)
             outs.append(o)
         o = torch.cat(outs, 0)
-        return self.pi(o), self.v(o).squeeze(-1), h
+        logits = self.pi(o)
+        if "act_mask" in x:  # masked buttons: probability ~3e-7, identical in training and evaluation
+            logits = logits.masked_fill(x["act_mask"] < 0.5, -15.0)
+        return logits, self.v(o).squeeze(-1), h
 
     def initial_state(self, batch: int, device="cpu") -> torch.Tensor:
         return torch.zeros(1, batch, self.hidden, device=device)
