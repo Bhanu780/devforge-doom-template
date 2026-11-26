@@ -61,9 +61,11 @@ MOVE_PENALTY_CAP = 4.0
 
 
 class Shaper:
-    def __init__(self, weapon_discipline: bool = False, loaded_switch_cost: float = 0.05):
+    def __init__(self, weapon_discipline: bool = False, loaded_switch_cost: float = 0.05,
+                 *, recovery_feedback: bool = False):
         self.weapon_discipline = weapon_discipline
         self.loaded_switch_cost = loaded_switch_cost
+        self.recovery_feedback = recovery_feedback
 
     def reset(self, env, observation=None) -> None:
         s = env.privileged_state()
@@ -109,6 +111,16 @@ class Shaper:
         ent = obs["visible_entities"]
         enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
         return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
+
+    @staticmethod
+    def _shot_on_target(obs) -> bool:
+        # The center ray includes monster radius and occlusion. Allow an aimed barrel shot,
+        # which can damage a nearby monster after a delay.
+        if obs["rays"]["hit_type"][0] == 4:
+            return True
+        ent = obs["visible_entities"]
+        barrels = ent["features"][(ent["mask"] > 0) & (ent["entity_type"] == 10)]
+        return bool(np.any((barrels[:, 2] > 0) & (np.abs(barrels[:, 1] * barrels[:, 0]) < 10 / 1024)))
 
     @staticmethod
     def _enemy_visible(obs) -> bool:
@@ -210,7 +222,8 @@ class Shaper:
         if use and not self.prev_use and not s["exit_reached"] and not self._gate_ahead(before):
             r += R["use_press"]
         self.prev_use = use
-        if action[6] and not landed and not self._enemy_in_sights(before):
+        aimed = self._shot_on_target(before) if self.recovery_feedback else self._enemy_in_sights(before)
+        if action[6] and not landed and not aimed:
             r += R["attack_no_target"]
         if self.weapon_discipline:
             switch = bool(action[8])
@@ -224,7 +237,10 @@ class Shaper:
             st["fists"] = st.get("fists", 0) + 1
         enemy = self._enemy_visible(obs)
         moved = math.hypot(s["x"] - p["x"], s["y"] - p["y"])
-        if action[0] and not action[1] and moved < BUMP_DIST and not enemy and not terminated:
+        attempted_move = bool(action[0] and not action[1])
+        if self.recovery_feedback:
+            attempted_move = bool(action[0] != action[1] or action[2] != action[3])
+        if attempted_move and moved < BUMP_DIST and not enemy and not terminated:
             r += self._move_penalty(R["bump"])  # pressing on into a stair lip or wall
             st["bumps"] = st.get("bumps", 0) + 1
         turn = int(action[4]) - int(action[5])
@@ -261,7 +277,8 @@ class Shaper:
         vit = np.asarray(obs["vitals"])
         prior_vitals = before["vitals"]
         ammo_spent = float(prior_vitals[3] - vit[3])
-        if vit[2] == prior_vitals[2] and ammo_spent > 0 and not landed and not self._enemy_visible(before):
+        wasted_shot = not aimed if self.recovery_feedback else not self._enemy_visible(before)
+        if vit[2] == prior_vitals[2] and ammo_spent > 0 and not landed and wasted_shot:
             r += R["ammo_wasted"] * ammo_spent
             st["wasted"] = st.get("wasted", 0) + int(ammo_spent)
         self.prev_observation = obs

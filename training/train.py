@@ -36,7 +36,8 @@ from model.policy import DoomPolicy  # noqa: E402
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
            curiosity: float, progression_only: bool, practice_maps: Path | None,
-           weapon_discipline: bool, loaded_switch_cost: float, arena_maps: Path | None):
+           weapon_discipline: bool, loaded_switch_cost: float, arena_maps: Path | None,
+           collision_aware: bool):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -49,7 +50,9 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     rng = np.random.default_rng(seed)
     pool = maps.build_pool("progression" if progression_only else "train", practice_maps, arena_maps)
     map_index = idx
-    env, fb, shaper = None, FeatureBuilder(include_rgb=use_rgb), Shaper(weapon_discipline, loaded_switch_cost)
+    env = None
+    fb = FeatureBuilder(include_rgb=use_rgb, collision_aware=collision_aware)
+    shaper = Shaper(weapon_discipline, loaded_switch_cost, recovery_feedback=collision_aware)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -238,11 +241,15 @@ def main():
     ap.add_argument("--navigation-anchor", type=float, default=0.0,
                     help="penalize drift in movement and Use from this run's starting policy")
     ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
+    ap.add_argument("--collision-aware", action="store_true",
+                    help="use ray-corrected stall observations and train with wall recovery and tighter aim feedback")
     ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--curiosity", type=float, default=0.05, help="intrinsic bonus per memory-map cell entry, / sqrt(entries) (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--export", action="store_true")
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument("--resume", action="store_true")
+    source.add_argument("--export", action="store_true")
+    source.add_argument("--init-weights", type=Path, help="start a new run from a policy export with a fresh optimizer")
     ap.add_argument("--export-path", type=Path, default=ROOT / "submission" / "weights" / "policy.pt")
     ap.add_argument("--max-updates", type=int, default=10**9)
     ap.add_argument("--save-every", type=int, default=20)
@@ -254,8 +261,8 @@ def main():
         ap.error("--save-every and --max-updates must be positive")
     if not math.isfinite(args.loaded_switch_cost) or args.loaded_switch_cost < 0:
         ap.error("--loaded-switch-cost must be finite and nonnegative")
-    if args.combat_head_only and not args.resume:
-        ap.error("--combat-head-only needs a trained checkpoint via --resume")
+    if args.combat_head_only and not (args.resume or args.init_weights):
+        ap.error("--combat-head-only needs trained weights via --resume or --init-weights")
     if args.practice_maps is not None and not any(args.practice_maps.glob("*.wad")):
         ap.error("--practice-maps must contain at least one WAD")
     if args.arena_maps is not None and not any(args.arena_maps.glob("*.wad")):
@@ -276,20 +283,26 @@ def main():
     use_rgb = not args.no_rgb
     exclusive_movement = args.exclusive_movement
     weapon_discipline = args.weapon_discipline
+    collision_aware = args.collision_aware
     latest = run_dir / "latest.pt"
     ck = None
-    if args.resume or args.export:
-        if not latest.is_file():
-            ap.error(f"missing trained checkpoint: {latest}")
-        ck = torch.load(latest, map_location=device, weights_only=False)
+    input_weights = latest if args.resume or args.export else args.init_weights
+    if input_weights is not None:
+        if not input_weights.is_file():
+            ap.error(f"missing trained checkpoint: {input_weights}")
+        if args.init_weights and latest.exists():
+            ap.error(f"run already has a checkpoint: {latest}. Choose a new --run or use --resume.")
+        ck = torch.load(input_weights, map_location=device, weights_only=False)
         use_rgb = ck["config"]["use_rgb"]
         exclusive_movement = exclusive_movement or ck["config"].get("exclusive_movement", False)
         weapon_discipline = weapon_discipline or ck["config"].get("weapon_discipline", False)
+        collision_aware = collision_aware or ck["config"].get("collision_aware", False)
     prior_combat_only = bool(ck and ck["config"].get("combat_head_only", False))
     combat_only = prior_combat_only if args.combat_head_only is None else args.combat_head_only
     model = DoomPolicy(use_rgb=use_rgb, hidden=ck["config"].get("hidden", 512) if ck else 512).to(device)
     config = {"hidden": model.hidden, "use_rgb": use_rgb, "exclusive_movement": exclusive_movement,
-              "weapon_discipline": weapon_discipline, "combat_head_only": combat_only}
+              "weapon_discipline": weapon_discipline, "combat_head_only": combat_only,
+              "collision_aware": collision_aware}
     action_stats = exclusive_logp_ent if exclusive_movement else bernoulli_logp_ent
     parameters = combat_parameters(model) if combat_only else model.parameters()
     opt = torch.optim.Adam(parameters, lr=args.lr, eps=1e-5)
@@ -298,6 +311,9 @@ def main():
 
     if ck is not None:
         model.load_state_dict(ck["model"])
+    if args.init_weights:
+        print(f"initialized policy from {args.init_weights} with a fresh optimizer", flush=True)
+    elif ck is not None:
         # Optimizer moments from full-policy training could update frozen action rows.
         if not args.export and combat_only == prior_combat_only:
             opt.load_state_dict(ck["opt"])
@@ -333,7 +349,8 @@ def main():
         p = ctx.Process(
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
-                  args.curiosity, args.progression_only, args.practice_maps, weapon_discipline, args.loaded_switch_cost, args.arena_maps),
+                  args.curiosity, args.progression_only, args.practice_maps,
+                  weapon_discipline, args.loaded_switch_cost, args.arena_maps, collision_aware),
             daemon=True,
         )
         p.start()

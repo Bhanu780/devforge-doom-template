@@ -397,3 +397,30 @@ at several intervals. One pass per rollout reduces learner time. Compare the
 candidate against its starting weights before using it. No-RGB rollouts omit
 the unused image tensors, and the recurrent model processes uninterrupted
 sequences in batches while resetting memory at episode boundaries.
+
+## Wall recovery and combat precision
+
+`--collision-aware` uses the velocity corrected by the static raycast scan for the
+policy's stuck feature. During training, blocked strafing and reversing receive
+the same bounded penalty as blocked forward motion. Shots use the pre-action
+center ray and measured damage for credit. Aimed shots at barrels are allowed
+in the reward, since barrels can damage nearby enemies. The inference action
+selection still comes from the same recurrent policy.
+
+Start a run from a compatible exported policy with `--init-weights path/to/policy.pt`.
+This starts a new optimizer and step counter. Use `--resume` to continue that run
+with its optimizer, feature configuration, and step counter.
+
+```bash
+python training/hard_levels.py training/runs/recovery_practice --count 48 --seed 23061
+DOOM_GROUPS=fd_early=0.40,fd=0.10,arena=0.15,small=0.10,progression=0.20,hard=0.05 \
+  python training/train.py --run recovery_mixed --init-weights path/to/policy.pt \
+  --collision-aware --weapon-discipline --seed 913 --workers 2 --steps 128 \
+  --epochs 1 --minibatches 2 --lr 0.0001 --navigation-anchor 0.07 \
+  --practice-maps training/runs/recovery_practice --arena-maps training/runs/arenas_train \
+  --episodes-per-map 1 --max-updates 128 --save-every 32
+```
+
+Compare MAP01 runs with `behavior_eval.py --maps MAP01 --seeds 2 --ticks 4200`.
+MAP01 is a development map in the training pool. Check transfer with `bench.py --split hard`
+and reserved Freedoom maps such as MAP04.

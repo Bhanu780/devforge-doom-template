@@ -41,7 +41,7 @@ class DoomAgent:
         self.model = DoomPolicy(hidden=cfg.get("hidden", 512), use_rgb=cfg.get("use_rgb", True))
         self.model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
         self.model.eval()
-        self.fb = FeatureBuilder(include_rgb=self.model.use_rgb)
+        self.fb = FeatureBuilder(include_rgb=self.model.use_rgb, collision_aware=cfg.get("collision_aware", False))
         self.temperature = TEMPERATURE
         self.reset()
 
