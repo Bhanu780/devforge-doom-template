@@ -1,0 +1,1266 @@
+From 33e3f85d446e4aabed4095a5b64e43ee19c157bc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 15:08:42 +0530
+Subject: [PATCH] Add memory-map agent, recurrent PPO trainer and benchmark
+
+- submission/model: odometry (Doom turn rule + velocity, static-scan wall check), ego-centric memory map, recurrent policy
+- submission/agent.py: crash-safe DoomAgent using the trained policy
+- training/: from-scratch recurrent PPO, shaped rewards, map pool/curriculum, held-out benchmark
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018DCtR1Atng8ok4n7T6yCWL
+---
+ .gitignore                   |   3 +
+ submission/agent.py          |  56 +++++-
+ submission/model/__init__.py |   4 +
+ submission/model/features.py | 288 +++++++++++++++++++++++++++
+ submission/model/policy.py   | 125 ++++++++++++
+ training/README.md           |  36 +++-
+ training/bench.py            |  84 ++++++++
+ training/extra_maps/.gitkeep |   0
+ training/maps.py             |  84 ++++++++
+ training/rewards.py          |  95 +++++++++
+ training/train.py            | 369 +++++++++++++++++++++++++++++++++++
+ 11 files changed, 1131 insertions(+), 13 deletions(-)
+ create mode 100644 submission/model/__init__.py
+ create mode 100644 submission/model/features.py
+ create mode 100644 submission/model/policy.py
+ create mode 100644 training/bench.py
+ create mode 100644 training/extra_maps/.gitkeep
+ create mode 100644 training/maps.py
+ create mode 100644 training/rewards.py
+ create mode 100644 training/train.py
+
+diff --git a/.gitignore b/.gitignore
+index d9b5ebb..e788c25 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -222,3 +222,6 @@ _vizdoom.ini
+ 
+ # Local validator / scorer artifacts
+ *.lmp
++
++# Training checkpoints and logs (only the shipped policy goes in submission/weights/)
++training/runs/
+diff --git a/submission/agent.py b/submission/agent.py
+index a3a75f5..849f69b 100644
+--- a/submission/agent.py
++++ b/submission/agent.py
+@@ -1,29 +1,67 @@
+-"""Evaluation entry point. The scorer instantiates DoomAgent from this file.
++"""Evaluation entry point (docs/CONTRACT.md §6).
+ 
+-Contract: docs/CONTRACT.md §6. This baseline acts randomly. Replace it with your trained agent.
++Every action comes from the trained network. The FeatureBuilder only encodes observations
++(odometry + memory map); it never chooses actions.
+ """
+ 
+ from __future__ import annotations
+ 
++import sys
+ from pathlib import Path
+ 
+ import numpy as np
++import torch
+ 
+ SUBMISSION_DIR = Path(__file__).resolve().parent
+-WEIGHTS_DIR = SUBMISSION_DIR / "weights"
++WEIGHTS = SUBMISSION_DIR / "weights" / "policy.pt"
++sys.path.insert(0, str(SUBMISSION_DIR))
++
++from model.features import FeatureBuilder  # noqa: E402
++from model.policy import DoomPolicy  # noqa: E402
++
++TEMPERATURE = 0.7  # < 1 = less random than training, > 0 so fixed seeds can't trap us in a loop
+ 
+ 
+ class DoomAgent:
+     def __init__(self, observation_space, action_space, device: str):
+-        """Called once. Load weights here (e.g. from WEIGHTS_DIR) onto `device` ("cuda" or "cpu")."""
+-        self.observation_space = observation_space
++        torch.set_num_threads(1)
+         self.action_space = action_space
+-        self.device = device
++        self.device = "cpu"  # a ~3 M parameter net at batch 1 is faster on CPU than via CUDA launches
++        self.fb = FeatureBuilder()
+         self.rng = np.random.default_rng(0)
++        self.model = None
++        if WEIGHTS.exists():
++            ckpt = torch.load(WEIGHTS, map_location="cpu", weights_only=False)
++            cfg = ckpt.get("config", {})
++            self.model = DoomPolicy(hidden=cfg.get("hidden", 512), use_rgb=cfg.get("use_rgb", True))
++            self.model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
++            self.model.eval()
++        self.temperature = TEMPERATURE
++        self.reset()
+ 
+     def reset(self) -> None:
+-        """Called before every map. Clear recurrent state, memory buffers and trackers here."""
++        self.fb.reset()
++        self.h = self.model.initial_state(1) if self.model is not None else None
++        self.last = np.zeros(9, np.int8)
+ 
++    @torch.no_grad()
+     def act(self, observation: dict) -> np.ndarray:
+-        """Return a MultiBinary action: int array of shape action_space.shape with values in {0, 1}."""
+-        return self.rng.integers(0, 2, size=self.action_space.shape, dtype=np.int8)
++        try:
++            feats = self.fb.step(observation)
++            if self.model is None:
++                action = np.zeros(9, np.int8)
++            else:
++                x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
++                logits, _, self.h = self.model(x, self.h)
++                p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
++                action = (self.rng.random(9) < p).astype(np.int8)
++            self.fb.note_action(action)
++            self.last = action
++            return action
++        except Exception as e:  # never crash: a crash freezes the player for the rest of the map
++            print(f"[agent] act() error: {e!r}", file=sys.stderr)
++            try:
++                self.fb.note_action(np.zeros(9, np.int8))
++            except Exception:
++                pass
++            return np.zeros(9, np.int8)
+diff --git a/submission/model/__init__.py b/submission/model/__init__.py
+new file mode 100644
+index 0000000..7e3a137
+--- /dev/null
++++ b/submission/model/__init__.py
+@@ -0,0 +1,4 @@
++from .features import FeatureBuilder
++from .policy import DoomPolicy
++
++__all__ = ["FeatureBuilder", "DoomPolicy"]
+diff --git a/submission/model/features.py b/submission/model/features.py
+new file mode 100644
+index 0000000..505157b
+--- /dev/null
++++ b/submission/model/features.py
+@@ -0,0 +1,288 @@
++"""Observation preprocessing shared by training and the evaluated agent.
++
++Turns the official observation dict into fixed-size arrays for the policy, and maintains the
++agent's own spatial memory:
++
++* Odometry: the wrapper gives no position or heading. Heading is integrated from our own TURN
++  buttons using vanilla Doom's turn rule (1.76 deg/tic while a turn button has been held for fewer
++  than 6 tics, then 3.52 deg/tic). Position is integrated from the player-frame velocity in
++  `vitals[14:16]`, rotated by that heading. Both are pure dead reckoning: no map coordinates.
++* Memory map: an allocentric grid (agent starts in the centre) where each step writes what the 64
++  rays and the visible entities hit, plus where the agent has been. The policy sees a 32x32 crop
++  rotated so that "ahead" is always up.
++
++Nothing here chooses actions; it only encodes observations (allowed by docs/RULES.md §1).
++"""
++
++from __future__ import annotations
++
++import math
++
++import numpy as np
++
++NUM_RAYS = 64
++RAY_RANGE = 1024.0
++MAX_ENT = 32
++FRAME_SKIP = 4
++
++# --- odometry constants (vanilla Doom, measured against the engine) ---------------------------
++SLOW_TURN_DEG = 360.0 * 320 / 65536  # 1.7578 deg per tic for the first 5 tics of a turn
++FAST_TURN_DEG = 360.0 * 640 / 65536  # 3.5156 deg per tic afterwards
++SLOW_TURN_TICS = 6
++START_DEAD_TICS = 7  # measured: no rotation during the first 7 tics of an episode
++# Step displacement ~= W_CUR * v_now + W_PREV * v_prev (least squares fit on Freedoom maps, rmse ~2.5 units/step)
++W_CUR, W_PREV = 2.6, 1.7
++
++# --- memory map ------------------------------------------------------------------------------
++CELL = 64.0  # map units per cell
++MAP_SIZE = 192  # cells per side (12,288 units); recentred when the agent nears an edge
++CROP = 32  # policy view: CROP x CROP cells around the agent, rotated ahead-up
++MAP_CHANNELS = ("free", "wall", "door", "locked", "item", "key", "enemy", "visited")
++C_FREE, C_WALL, C_DOOR, C_LOCKED, C_ITEM, C_KEY, C_ENEMY, C_VISITED = range(len(MAP_CHANNELS))
++ENEMY_DECAY = 0.97  # per step (enemy marks fade over ~10 s)
++
++# entity type ids (doom_env.spaces.ENTITY_TYPES)
++ENT_ENEMY = (1, 2, 3)
++ENT_KEY = 9
++ENT_ITEMS = (5, 6, 7, 8, 11)
++
++RGB_H, RGB_W = 60, 80
++EXTRA_DIM = 17 + 9 + 6  # vitals + previous action + own features
++
++
++def rgb_small(obs: dict) -> np.ndarray:
++    """(4, 60, 80) uint8: RGB + depth at half resolution."""
++    rgb = obs["rgb"][::2, ::2]
++    depth = obs["depth"][::2, ::2, None]
++    return np.ascontiguousarray(np.concatenate([rgb, depth], axis=2).transpose(2, 0, 1))
++
++
++class FeatureBuilder:
++    """Stateful encoder. Call reset() at the start of each map and step(obs) once per decision,
++    then note_action(action) with the action actually sent."""
++
++    def __init__(self):
++        # Crop sampling offsets in the agent frame (x forward, y left), one per crop cell.
++        # Row 0 = far ahead, column 0 = far left, so the crop shows ahead-up.
++        idx = np.arange(CROP) - CROP / 2 + 0.5
++        fwd = -idx[:, None] * np.ones(CROP)[None, :]  # rows: ahead at the top
++        left = -idx[None, :] * np.ones(CROP)[:, None]  # cols: left on the left
++        self._crop_fwd = fwd.ravel() * CELL
++        self._crop_left = left.ravel() * CELL
++        ang = np.arange(NUM_RAYS) * (2 * math.pi / NUM_RAYS)
++        self._ray_cos, self._ray_sin = np.cos(ang), np.sin(ang)
++        self._samples = np.linspace(0.0, 1.0, 24)[None, :]  # points along each ray for "free"
++        self.reset()
++
++    # ------------------------------------------------------------------ state
++    def reset(self) -> None:
++        self.map = np.zeros((len(MAP_CHANNELS), MAP_SIZE, MAP_SIZE), np.float32)
++        self.x = self.y = 0.0  # map units, relative to the start
++        self.heading = 0.0  # radians, relative to the start
++        self.turn_held = 0
++        self.tic = 0
++        self.prev_vel = (0.0, 0.0)
++        self._prev_dist = self._prev_hit = None
++        self._pending_turn = 0.0
++        self.prev_action = np.zeros(9, np.float32)
++        self.steps = 0
++        self.steps_since_use = 100
++        self.stuck = 0
++        self.steps_since_damage = 100
++        self.last_health = None
++        self.origin = np.array([MAP_SIZE / 2, MAP_SIZE / 2])  # cell of world (0, 0)
++
++    def note_action(self, action) -> None:
++        """Record the action sent this step (drives heading odometry and the action input)."""
++        a = np.asarray(action, np.float32).reshape(9)
++        # Heading: the engine applies the turn buttons during the 4 tics of this step.
++        left, right = a[4] > 0.5, a[5] > 0.5
++        deg = 0.0
++        if left or right:
++            for _ in range(FRAME_SKIP):
++                self.turn_held += 1
++                self.tic += 1
++                if self.tic <= START_DEAD_TICS:  # the engine ignores turning right after spawn
++                    continue
++                step = SLOW_TURN_DEG if self.turn_held < SLOW_TURN_TICS else FAST_TURN_DEG
++                deg += step * (int(left) - int(right))
++        else:
++            self.turn_held = 0
++            self.tic += FRAME_SKIP
++        self._pending_turn = math.radians(deg)
++        self.steps_since_use = 0 if a[7] > 0.5 else self.steps_since_use + 1
++        self.prev_action = a
++
++    # ------------------------------------------------------------------ main
++    def step(self, obs: dict) -> dict:
++        """Update odometry and memory from a fresh observation; return policy inputs."""
++        vit = np.asarray(obs["vitals"], np.float32)
++        self._pending_turn_applied = getattr(self, "_pending_turn", 0.0)
++        if self.steps > 0:
++            self.heading += self._pending_turn_applied
++            # Velocity is reported in the frame of the *new* heading after the step.
++            fwd, right = float(vit[14]), float(vit[15])
++            fwd, right = self._unblock(obs, fwd, right)
++            c, s = math.cos(self.heading), math.sin(self.heading)
++            vx, vy = fwd * c + right * s, fwd * s - right * c  # world-frame velocity now
++            self.x += W_CUR * vx + W_PREV * self.prev_vel[0]
++            self.y += W_CUR * vy + W_PREV * self.prev_vel[1]
++            self.prev_vel = (vx, vy)
++        self._pending_turn = 0.0
++        self.steps += 1
++
++        speed = math.hypot(float(vit[14]), float(vit[15]))
++        self.stuck = self.stuck + 1 if (speed < 0.5 and self.prev_action[:4].any()) else 0
++        hp = float(vit[0])
++        if self.last_health is not None and hp < self.last_health:
++            self.steps_since_damage = 0
++        else:
++            self.steps_since_damage += 1
++        self.last_health = hp
++
++        self._recentre_if_needed()
++        self._write_map(obs)
++        cx, cy = self._cell(self.x, self.y)
++        here_visits = float(self.map[C_VISITED, cy, cx])
++
++        extra = np.zeros(EXTRA_DIM, np.float32)
++        v = extra[:17]
++        v[:] = vit
++        v[0] /= 100.0
++        v[1] /= 100.0
++        v[2] /= 7.0
++        v[3:8] = np.log1p(np.maximum(vit[3:8], 0)) / 5.0
++        v[14:17] = vit[14:17] / 16.0
++        extra[17:26] = self.prev_action
++        extra[26] = min(self.steps_since_use, 20) / 20.0
++        extra[27] = min(self.stuck, 20) / 20.0
++        extra[28] = min(self.steps_since_damage, 40) / 40.0
++        extra[29] = math.log1p(here_visits) / 4.0
++        extra[30] = min(self.turn_held, 12) / 12.0
++        extra[31] = 1.0  # bias
++
++        ent = obs["visible_entities"]
++        return {
++            "ray_dist": np.asarray(obs["rays"]["distance"], np.float32),
++            "ray_type": np.asarray(obs["rays"]["hit_type"], np.int64),
++            "ent_feat": np.clip(np.asarray(ent["features"], np.float32), -8, 8),
++            "ent_type": np.asarray(ent["entity_type"], np.int64),
++            "ent_mask": np.asarray(ent["mask"], np.float32),
++            "extra": extra,
++            "map": self._crop(),
++            "rgb": rgb_small(obs),
++        }
++
++    def _unblock(self, obs: dict, fwd: float, right: float) -> tuple[float, float]:
++        """Doom keeps reporting momentum while the player pushes into a wall. Remove it:
++        A static scan (no turn, wall rays unchanged) means we did not move."""
++        dist = np.asarray(obs["rays"]["distance"], np.float64) * RAY_RANGE
++        hit = np.asarray(obs["rays"]["hit_type"])
++        static = False
++        if self._prev_dist is not None:
++            turn = getattr(self, "_pending_turn_applied", 0.0)
++            if turn == 0.0:
++                walls = (hit >= 1) & (hit <= 3) & (self._prev_hit >= 1) & (self._prev_hit <= 3)
++                static = walls.sum() >= 16 and np.max(np.abs(dist[walls] - self._prev_dist[walls])) < 0.75
++            else:
++                # previous scan seen from the new heading: new ray i looks where old ray i + turn did
++                pos = (np.arange(NUM_RAYS) + turn / (2 * math.pi / NUM_RAYS)) % NUM_RAYS
++                lo = np.floor(pos).astype(int)
++                fr = pos - lo
++                hi = (lo + 1) % NUM_RAYS
++                prev = self._prev_dist[lo] * (1 - fr) + self._prev_dist[hi] * fr
++                pw = (self._prev_hit[lo] >= 1) & (self._prev_hit[lo] <= 3) & (self._prev_hit[hi] >= 1) & (self._prev_hit[hi] <= 3)
++                walls = (hit >= 1) & (hit <= 3) & pw & (dist < 512)
++                static = walls.sum() >= 16 and np.percentile(np.abs(dist[walls] - prev[walls]), 80) < 1.5
++        self._prev_dist, self._prev_hit = dist, hit
++        if static:
++            self.prev_vel = (0.0, 0.0)
++            return 0.0, 0.0
++        return fwd, right
++
++    # ------------------------------------------------------------------ map helpers
++    def _cell(self, x, y):
++        cx = np.floor(self.origin[0] + np.asarray(x) / CELL).astype(np.int64)
++        cy = np.floor(self.origin[1] - np.asarray(y) / CELL).astype(np.int64)  # +y = up = row--
++        return cx, cy
++
++    def _recentre_if_needed(self) -> None:
++        cx, cy = self._cell(self.x, self.y)
++        margin = CROP
++        if margin <= cx < MAP_SIZE - margin and margin <= cy < MAP_SIZE - margin:
++            return
++        dx = int(MAP_SIZE / 2 - cx)
++        dy = int(MAP_SIZE / 2 - cy)
++        shifted = np.zeros_like(self.map)
++        sx0, sx1 = max(0, -dx), min(MAP_SIZE, MAP_SIZE - dx)
++        sy0, sy1 = max(0, -dy), min(MAP_SIZE, MAP_SIZE - dy)
++        shifted[:, sy0 + dy:sy1 + dy, sx0 + dx:sx1 + dx] = self.map[:, sy0:sy1, sx0:sx1]
++        self.map = shifted
++        self.origin = self.origin + np.array([dx, dy])
++
++    def _write_map(self, obs: dict) -> None:
++        m = self.map
++        m[C_ENEMY] *= ENEMY_DECAY
++        h = self.heading
++        c, s = math.cos(h), math.sin(h)
++        # ray directions in the map frame (ray 0 = ahead, counter-clockwise)
++        dx = c * self._ray_cos - s * self._ray_sin
++        dy = s * self._ray_cos + c * self._ray_sin
++        dist = np.asarray(obs["rays"]["distance"], np.float64) * RAY_RANGE
++        hit = np.asarray(obs["rays"]["hit_type"])
++
++        # free space along each ray (stop just short of the hit)
++        t = self._samples * np.maximum(dist[:, None] - CELL * 0.5, 0.0)
++        fx, fy = self._cell(self.x + dx[:, None] * t, self.y + dy[:, None] * t)
++        ok = (fx >= 0) & (fx < MAP_SIZE) & (fy >= 0) & (fy < MAP_SIZE)
++        m[C_FREE, fy[ok], fx[ok]] = 1.0
++
++        # hit points
++        has = hit > 0
++        if has.any():
++            hx, hy = self._cell(self.x + dx[has] * dist[has], self.y + dy[has] * dist[has])
++            ht = hit[has]
++            ok = (hx >= 0) & (hx < MAP_SIZE) & (hy >= 0) & (hy < MAP_SIZE)
++            hx, hy, ht = hx[ok], hy[ok], ht[ok]
++            for code, ch in ((1, C_WALL), (2, C_DOOR), (3, C_LOCKED), (5, C_ITEM)):
++                sel = ht == code
++                if sel.any():
++                    m[ch, hy[sel], hx[sel]] = 1.0
++            # an open door no longer blocks rays: clear stale door marks along free space
++            m[C_DOOR] *= 1.0 - m[C_FREE] * (m[C_WALL] == 0)
++
++        # visible entities
++        ent = obs["visible_entities"]
++        mask = np.asarray(ent["mask"]) > 0
++        if mask.any():
++            f = np.asarray(ent["features"])[mask]
++            et = np.asarray(ent["entity_type"])[mask]
++            d = f[:, 0] * RAY_RANGE
++            sa, ca = f[:, 1], f[:, 2]
++            wx = self.x + d * (ca * c - sa * s)
++            wy = self.y + d * (ca * s + sa * c)
++            ex, ey = self._cell(wx, wy)
++            ok = (ex >= 0) & (ex < MAP_SIZE) & (ey >= 0) & (ey < MAP_SIZE)
++            for sel, ch in ((np.isin(et, ENT_ENEMY), C_ENEMY), (et == ENT_KEY, C_KEY), (np.isin(et, ENT_ITEMS), C_ITEM)):
++                sel = sel & ok
++                if sel.any():
++                    m[ch, ey[sel], ex[sel]] = 1.0
++
++        # where we are; a key we just picked up disappears, so clear key marks under us
++        cx, cy = self._cell(self.x, self.y)
++        if 0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE:
++            m[C_VISITED, cy, cx] += 1.0
++            m[C_KEY, max(cy - 1, 0):cy + 2, max(cx - 1, 0):cx + 2] = 0.0
++            m[C_ITEM, max(cy - 1, 0):cy + 2, max(cx - 1, 0):cx + 2] = 0.0
++            m[C_FREE, cy, cx] = 1.0
++
++    def _crop(self) -> np.ndarray:
++        c, s = math.cos(self.heading), math.sin(self.heading)
++        wx = self.x + self._crop_fwd * c - self._crop_left * s
++        wy = self.y + self._crop_fwd * s + self._crop_left * c
++        cx, cy = self._cell(wx, wy)
++        ok = (cx >= 0) & (cx < MAP_SIZE) & (cy >= 0) & (cy < MAP_SIZE)
++        out = np.zeros((len(MAP_CHANNELS), CROP * CROP), np.float32)
++        out[:, ok] = self.map[:, cy[ok], cx[ok]]
++        out[C_VISITED] = np.log1p(out[C_VISITED]) / 3.0
++        return out.reshape(len(MAP_CHANNELS), CROP, CROP)
+diff --git a/submission/model/policy.py b/submission/model/policy.py
+new file mode 100644
+index 0000000..ff34afa
+--- /dev/null
++++ b/submission/model/policy.py
+@@ -0,0 +1,125 @@
++"""Recurrent actor-critic for doom_env. ~3 M parameters, < 5 ms per step on one CPU thread.
++
++Inputs come from features.FeatureBuilder. Each modality has its own encoder:
++  rays     -> circular 1D conv over the 64 ego-centric rays (hit-type embedding + distance)
++  entities -> per-entity MLP + masked self-attention + pooling (handles 0..32 entities)
++  map      -> small CNN over the 32x32 ahead-up crop of the memory map
++  rgb      -> small CNN over 60x80 RGB+depth (exit switches/signs are only visible here)
++  extra    -> vitals, previous action and own counters
++The fused vector drives a GRU; heads output 9 independent Bernoulli logits and a value.
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from .features import CROP, EXTRA_DIM, MAP_CHANNELS, NUM_RAYS
++
++NUM_BUTTONS = 9
++NUM_HIT_TYPES = 6
++NUM_ENT_TYPES = 12
++
++
++class RayEncoder(nn.Module):
++    def __init__(self, out=256):
++        super().__init__()
++        self.emb = nn.Embedding(NUM_HIT_TYPES, 8)
++        self.c1 = nn.Conv1d(10, 32, 5)
++        self.c2 = nn.Conv1d(32, 64, 5, stride=2)
++        self.c3 = nn.Conv1d(64, 64, 3, stride=2)
++        self.fc = nn.Linear(64 * 16, out)
++
++    @staticmethod
++    def _circ(x, k):  # circular padding keeps "behind" next to "left/right"
++        p = k // 2
++        return torch.cat([x[..., -p:], x, x[..., :p]], dim=-1)
++
++    def forward(self, dist, htype):
++        d = dist.unsqueeze(1)
++        x = torch.cat([self.emb(htype).transpose(1, 2), d, (d < 0.05).float()], 1)  # (B,10,64)
++        x = F.relu(self.c1(self._circ(x, 5)))
++        x = F.relu(self.c2(self._circ(x, 5)))[..., :32]
++        x = F.relu(self.c3(self._circ(x, 3)))[..., :16]
++        return F.relu(self.fc(x.flatten(1)))
++
++
++class EntityEncoder(nn.Module):
++    def __init__(self, d=64, out=128):
++        super().__init__()
++        self.emb = nn.Embedding(NUM_ENT_TYPES, 16)
++        self.inp = nn.Sequential(nn.Linear(5 + 16, d), nn.ReLU(), nn.Linear(d, d))
++        self.null = nn.Parameter(torch.zeros(1, 1, d))  # always-present token: no all-masked rows
++        self.attn = nn.MultiheadAttention(d, 4, batch_first=True)
++        self.ff = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))
++        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
++        self.out = nn.Linear(2 * d, out)
++
++    def forward(self, feat, etype, mask):
++        b = feat.shape[0]
++        x = self.inp(torch.cat([feat, self.emb(etype)], -1))  # (B,32,d)
++        x = torch.cat([self.null.expand(b, -1, -1), x], 1)
++        m = torch.cat([torch.ones(b, 1, device=mask.device), mask], 1) > 0.5
++        h = self.n1(x + self.attn(x, x, x, key_padding_mask=~m, need_weights=False)[0])
++        h = self.n2(h + self.ff(h))
++        mf = m.unsqueeze(-1).float()
++        mean = (h * mf).sum(1) / mf.sum(1)
++        mx = h.masked_fill(~m.unsqueeze(-1), -1e4).max(1).values
++        return F.relu(self.out(torch.cat([mean, mx], -1)))
++
++
++def conv_stack(cin, chans, out_hw, out):
++    layers, c = [], cin
++    for k in chans:
++        layers += [nn.Conv2d(c, k, 3, stride=2, padding=1), nn.ReLU()]
++        c = k
++    return nn.Sequential(*layers, nn.Flatten(), nn.Linear(c * out_hw, out), nn.ReLU())
++
++
++class DoomPolicy(nn.Module):
++    def __init__(self, hidden=512, use_rgb=True):
++        super().__init__()
++        self.use_rgb = use_rgb
++        self.rays = RayEncoder(256)
++        self.ents = EntityEncoder(64, 128)
++        self.map = conv_stack(len(MAP_CHANNELS), (32, 64, 64), (CROP // 8) ** 2, 256)
++        self.rgb = conv_stack(4, (16, 32, 64, 64), 4 * 5, 256)  # 60x80 -> 30x40 -> 15x20 -> 8x10 -> 4x5
++        self.extra = nn.Sequential(nn.Linear(EXTRA_DIM, 128), nn.ReLU())
++        self.fuse = nn.Sequential(nn.Linear(256 + 128 + 256 + 256 + 128, hidden), nn.ReLU())
++        self.gru = nn.GRU(hidden, hidden)
++        self.pi = nn.Sequential(nn.Linear(hidden, 256), nn.ReLU(), nn.Linear(256, NUM_BUTTONS))
++        self.v = nn.Sequential(nn.Linear(hidden, 256), nn.ReLU(), nn.Linear(256, 1))
++        self.hidden = hidden
++        with torch.no_grad():  # start with few buttons pressed, forward slightly favoured
++            self.pi[-1].weight.mul_(0.01)
++            self.pi[-1].bias.copy_(torch.tensor([0.5, -2, -1.5, -1.5, -1, -1, -1, -2, -4.0]))
++
++    def encode(self, x: dict) -> torch.Tensor:
++        """x: dict of (B, ...) tensors from FeatureBuilder outputs."""
++        parts = [
++            self.rays(x["ray_dist"], x["ray_type"]),
++            self.ents(x["ent_feat"], x["ent_type"], x["ent_mask"]),
++            self.map(x["map"]),
++            self.rgb(x["rgb"].float() / 255.0) if self.use_rgb else torch.zeros(x["extra"].shape[0], 256, device=x["extra"].device),
++            self.extra(x["extra"]),
++        ]
++        return self.fuse(torch.cat(parts, -1))
++
++    def forward(self, x: dict, h: torch.Tensor, done: torch.Tensor | None = None):
++        """Sequence forward. x tensors are (T, B, ...); h is (1, B, H); done (T, B) resets h
++        *before* step t. Returns logits (T,B,9), value (T,B), h."""
++        T, B = x["extra"].shape[:2]
++        flat = {k: v.reshape(T * B, *v.shape[2:]) for k, v in x.items()}
++        z = self.encode(flat).reshape(T, B, -1)
++        outs = []
++        for t in range(T):
++            if done is not None:
++                h = h * (1.0 - done[t]).view(1, B, 1)
++            o, h = self.gru(z[t:t + 1], h)
++            outs.append(o)
++        o = torch.cat(outs, 0)
++        return self.pi(o), self.v(o).squeeze(-1), h
++
++    def initial_state(self, batch: int, device="cpu") -> torch.Tensor:
++        return torch.zeros(1, batch, self.hidden, device=device)
+diff --git a/training/README.md b/training/README.md
+index 63a0813..974bb2f 100644
+--- a/training/README.md
++++ b/training/README.md
+@@ -1,7 +1,35 @@
+ # Training
+ 
+-Put your training pipeline here: environment setup, reward shaping, curriculum, model code, logs.
+-Judges review this folder during manual review.
++Everything the judges need to reproduce the agent. Model code lives in `submission/model/` so that
++training and the evaluated `submission/agent.py` share exactly the same preprocessing and network.
+ 
+-You may modify the engine, maps and game variables freely **for training**. Evaluation always uses
+-the vanilla engine through the official `doom_env` wrapper, so train on `doom_env` observations.
++## Pieces
++
++| File | What it does |
++| --- | --- |
++| `submission/model/features.py` | Odometry (heading from our own turn buttons using Doom's slow/fast turn rule; position from player-frame velocity; static-scan check for wall pushing) and the ego-centric memory map (free, wall, door, locked door, item, key, enemy, visited), cropped 32x32 ahead-up for the policy |
++| `submission/model/policy.py` | Recurrent actor-critic: circular ray conv, masked entity self-attention, map CNN, RGB+depth CNN, GRU 512, 9 Bernoulli buttons + value |
++| `training/train.py` | Our own recurrent PPO: one subprocess per core, GPU learner, truncated BPTT over 32-step chunks, GAE, return normalisation, entropy and LR schedules |
++| `training/rewards.py` | Shaped reward from `privileged_state()` (training only): exit, keys, doors, locked doors, new areas, kills, damage, death |
++| `training/maps.py` | Map pool (Freedoom 2 MAP01-32, bundled ViZDoom scenarios, repo test WADs, anything in `training/extra_maps/`) and the curriculum weights |
++| `training/bench.py` | Held-out benchmark (6 Freedoom maps + `defend_the_line`) through the real `DoomAgent` |
++
++## Run it (friend's laptop: RTX 4060, Windows or Linux)
++
++```bash
++uv sync                                   # vizdoom, gymnasium, the doom_env wrapper
++uv pip install torch --index-url https://download.pytorch.org/whl/cu128   # CUDA torch for the RTX 4060
++uv pip install tensorboard
++uv run python -c "import torch; print(torch.cuda.is_available())"         # must print True
++uv run python training/train.py --workers 10 --run main            # ~1 worker per physical core minus 2
++uv run tensorboard --logdir training/runs                          # watch ep/exit, ep/cells, ep/ret
++```
++
++- Stop any time with Ctrl+C; continue with `--resume`. `latest.pt` is saved every 20 updates and an
++  fp16 snapshot `policy_XXXXM.pt` every 100 updates.
++- Check a snapshot: `uv run python training/bench.py --weights training/runs/main/policy_0020M.pt --procs 6`.
++- Ship one: copy it to `submission/weights/policy.pt` (or `train.py --run main --export` for the latest), then
++  `python validate.py --docker`, then `git add submission/weights/policy.pt && git commit && git push` (Git LFS).
++- Want more maps? Put any Doom 2 format WAD into `training/extra_maps/` (fewer than 2,048 sectors per map).
++- Throughput is CPU-bound (big Freedoom maps run 100-500 steps/s per core). If the reward curve is flat
++  after 1-2 M steps, run with `DOOM_GROUPS="small=1,fd_early=1"` first, then resume without it.
+diff --git a/training/bench.py b/training/bench.py
+new file mode 100644
+index 0000000..ce3bfcb
+--- /dev/null
++++ b/training/bench.py
+@@ -0,0 +1,84 @@
++"""Held-out benchmark that runs the *submission* agent (submission/agent.py) exactly as evaluated.
++
++    python training/bench.py                                  # submission/weights/policy.pt
++    python training/bench.py --weights training/runs/main/policy_0020M.pt --procs 6
++
++Prints per-map metrics and a proxy score (the real weights are hidden; exit dominates).
++"""
++
++from __future__ import annotations
++
++import argparse
++import multiprocessing as mp
++import sys
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def proxy_score(st) -> float:
++    return 100 * st["exit"] + 15 * st["keys"] + 5 * st["doors"] + 10 * st["locked"] + 0.5 * st["cells"] \
++        + 2 * st["kills"] - 0.05 * st["dmg"] - 20 * st["death"]
++
++
++def run_one(job):
++    wad, mapname, seed, ticks, weights = job
++    import os
++    import warnings
++
++    warnings.filterwarnings("ignore")
++    os.environ["OMP_NUM_THREADS"] = "1"
++    sys.path.insert(0, str(ROOT / "training"))
++    from doom_env import make_env
++
++    from rewards import Shaper
++
++    sys.path.insert(0, str(ROOT / "submission"))
++    import agent as agent_mod  # the real evaluated entry point
++
++    agent_mod.WEIGHTS = Path(weights) if weights else ROOT / "submission" / "weights" / "policy.pt"
++    env = make_env(wad, mapname, episode_ticks=ticks)
++    agent = agent_mod.DoomAgent(env.observation_space, env.action_space, "cpu")
++    agent.rng = np.random.default_rng(seed)
++    obs, _ = env.reset(seed=seed)
++    agent.reset()
++    sh = Shaper()
++    sh.reset(env)
++    while True:
++        a = agent.act(obs)
++        obs, _, te, tu, _ = env.step(a)
++        sh.step(env, a, obs, te or tu)
++        if te or tu:
++            break
++    env.close()
++    st = dict(sh.stats)
++    st["map"] = f"{Path(wad).stem}:{mapname}"
++    st["score"] = proxy_score(st)
++    return st
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--weights", default="")
++    ap.add_argument("--procs", type=int, default=4)
++    ap.add_argument("--seeds", type=int, default=2)
++    ap.add_argument("--ticks", type=int, default=4200)
++    args = ap.parse_args()
++    sys.path.insert(0, str(ROOT / "training"))
++    import maps
++
++    jobs = [(w, m, s, args.ticks, str(Path(args.weights).resolve()) if args.weights else "")
++            for (w, m, _) in maps.build_pool("val") for s in range(args.seeds)]
++    with mp.get_context("spawn").Pool(args.procs) as pool:
++        res = pool.map(run_one, jobs)
++    keys = ("exit", "death", "keys", "doors", "locked", "cells", "kills", "dmg", "score")
++    print(f"{'map':32s} " + " ".join(f"{k:>6s}" for k in keys))
++    for r in res:
++        print(f"{r['map']:32s} " + " ".join(f"{r[k]:6.1f}" for k in keys))
++    print(f"{'MEAN':32s} " + " ".join(f"{np.mean([r[k] for r in res]):6.1f}" for k in keys))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/training/extra_maps/.gitkeep b/training/extra_maps/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/training/maps.py b/training/maps.py
+new file mode 100644
+index 0000000..d7415ef
+--- /dev/null
++++ b/training/maps.py
+@@ -0,0 +1,84 @@
++"""Training / validation map pool. Everything here ships with vizdoom or this repo: no downloads.
++
++Pool entries: (wad path, map name, group). Groups drive the curriculum weights in sample().
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import numpy as np
++import vizdoom
++
++from doom_env.wad import list_maps, read_wad
++
++ROOT = Path(__file__).resolve().parents[1]
++VZ = Path(os.path.dirname(vizdoom.__file__))
++FREEDOOM2 = VZ / "freedoom2.wad"
++SCENARIOS = VZ / "scenarios"
++
++# Held out for the benchmark only (never trained on).
++HELDOUT_FREEDOOM = {"MAP04", "MAP09", "MAP14", "MAP19", "MAP24", "MAP29"}
++HELDOUT_SCENARIOS = {"defend_the_line"}
++SCENARIO_NAMES = ["defend_the_center", "defend_the_line", "deadly_corridor", "health_gathering",
++                  "health_gathering_supreme", "my_way_home", "take_cover", "basic", "rocket_basic"]
++
++# Extra maps you add (any Doom/UDMF WAD): drop them in training/extra_maps/; all their maps are used.
++EXTRA_DIR = ROOT / "training" / "extra_maps"
++
++
++def _maps_in(wad: Path) -> list[str]:
++    try:
++        return list_maps(read_wad(wad))
++    except Exception:
++        return []
++
++
++def build_pool(split: str = "train") -> list[tuple[str, str, str]]:
++    pool: list[tuple[str, str, str]] = []
++    for m in _maps_in(FREEDOOM2):
++        held = m in HELDOUT_FREEDOOM
++        if (split == "val") == held:
++            num = int(m[3:]) if m[3:].isdigit() else 99
++            pool.append((str(FREEDOOM2), m, "fd_early" if num <= 8 else "fd"))
++    for name in SCENARIO_NAMES:
++        wad = SCENARIOS / f"{name}.wad"
++        if wad.exists() and (split == "val") == (name in HELDOUT_SCENARIOS):
++            for m in _maps_in(wad)[:1]:
++                pool.append((str(wad), m, "small"))
++    if split == "train":
++        for wad in sorted((ROOT / "tests" / "fixtures").glob("*.wad")) + [ROOT / "maps" / "two_rooms.wad"]:
++            for m in _maps_in(wad):
++                pool.append((str(wad), m, "small"))
++        if EXTRA_DIR.exists():
++            for wad in sorted(EXTRA_DIR.glob("*.wad")):
++                for m in _maps_in(wad):
++                    pool.append((str(wad), m, "fd"))
++    return pool
++
++
++# Curriculum: group weights as a function of training progress (env steps).
++def group_weights(env_steps: int) -> dict[str, float]:
++    override = os.environ.get("DOOM_GROUPS")  # e.g. DOOM_GROUPS="small=1,fd_early=1"
++    if override:
++        return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
++    if env_steps < 3_000_000:
++        return {"small": 0.6, "fd_early": 0.4, "fd": 0.0}
++    if env_steps < 8_000_000:
++        return {"small": 0.35, "fd_early": 0.35, "fd": 0.3}
++    return {"small": 0.25, "fd_early": 0.25, "fd": 0.5}
++
++
++def sample(pool, env_steps: int, rng: np.random.Generator):
++    w = group_weights(env_steps)
++    weights = np.array([w.get(g, 0.0) for _, _, g in pool], np.float64)
++    # normalise per group so a group's share doesn't depend on how many maps it has
++    for g in set(x[2] for x in pool):
++        idx = [i for i, x in enumerate(pool) if x[2] == g]
++        if weights[idx].sum() > 0:
++            weights[idx] /= len(idx)
++    if weights.sum() <= 0:
++        weights[:] = 1.0
++    i = rng.choice(len(pool), p=weights / weights.sum())
++    return pool[i]
+diff --git a/training/rewards.py b/training/rewards.py
+new file mode 100644
+index 0000000..3105528
+--- /dev/null
++++ b/training/rewards.py
+@@ -0,0 +1,95 @@
++"""Reward shaping from env.privileged_state() (training only; never seen by the agent).
++
++Mirrors the scorer's categories: exit (largest), progression (keys, doors), exploration
++(unique areas), combat (kills, damage, death).
++"""
++
++from __future__ import annotations
++
++import numpy as np
++
++R = dict(
++    exit=20.0,
++    exit_health=0.05,  # per remaining HP at exit
++    key=5.0,
++    door=1.0,
++    locked_door=4.0,
++    cell=0.1,  # new 128x128-unit area visited
++    kill=1.0,
++    damage=-0.02,  # per HP lost
++    death=-5.0,
++    item=0.1,
++    step=-0.002,
++    use_press=-0.02,  # discourages USE spam (it bounces doors)
++    attack_no_target=-0.003,
++)
++CELL = 128.0
++PLAYER_HEIGHT = 56.0
++
++
++class Shaper:
++    def reset(self, env) -> None:
++        s = env.privileged_state()
++        self.prev = s
++        self.cells = {self._cell(s)}
++        lock = s["door_lock"]
++        self.door_ids = np.flatnonzero(lock >= 0) if lock is not None else np.zeros(0, int)
++        self.door_open = self._open(s)  # doors already open at spawn don't count
++        self.door_ever = self.door_open.copy()
++        self.prev_use = False
++        self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0)
++
++    @staticmethod
++    def _cell(s):
++        return (int(s["x"] // CELL), int(s["y"] // CELL))
++
++    def _open(self, s):
++        if s["sector_floor"] is None or len(self.door_ids) == 0:
++            return np.zeros(len(self.door_ids), bool)
++        return (s["sector_ceiling"][self.door_ids] - s["sector_floor"][self.door_ids]) >= PLAYER_HEIGHT
++
++    def step(self, env, action, obs, terminated: bool) -> float:
++        s = env.privileged_state()
++        p = self.prev
++        r = R["step"]
++        st = self.stats
++        if s["exit_reached"]:
++            r += R["exit"] + R["exit_health"] * max(s["health"], 0)
++            st["exit"] = 1
++        if s["dead"]:
++            r += R["death"]
++            st["death"] = 1
++        dk = s["kills"] - p["kills"]
++        r += R["kill"] * dk
++        st["kills"] += dk
++        dd = max(0.0, s["damage_taken"] - p["damage_taken"])
++        r += R["damage"] * dd
++        st["dmg"] += dd
++        nk = float(np.sum(s["keys"]) - np.sum(p["keys"]))
++        r += R["key"] * nk
++        st["keys"] += int(nk)
++        r += R["item"] * max(0, s["items"] - p["items"])
++        c = self._cell(s)
++        if c not in self.cells and not terminated:
++            self.cells.add(c)
++            r += R["cell"]
++            st["cells"] += 1
++        if len(self.door_ids) and not terminated:
++            now = self._open(s)
++            new = now & ~self.door_ever
++            if new.any():
++                locked = s["door_lock"][self.door_ids[new]] > 0
++                r += R["door"] * int((~locked).sum()) + R["locked_door"] * int(locked.sum())
++                st["doors"] += int((~locked).sum())
++                st["locked"] += int(locked.sum())
++                self.door_ever |= now
++        use = bool(action[7])
++        if use and not self.prev_use:
++            r += R["use_press"]
++        self.prev_use = use
++        if action[6] and not obs["visible_entities"]["mask"].any():
++            r += R["attack_no_target"]
++        self.prev = s
++        st["ret"] += r
++        st["steps"] += 1
++        return float(r)
+diff --git a/training/train.py b/training/train.py
+new file mode 100644
+index 0000000..9916407
+--- /dev/null
++++ b/training/train.py
+@@ -0,0 +1,369 @@
++"""Recurrent PPO for doom_env, written from scratch (no SB3).
++
++    python training/train.py --workers 10 --run main            # train (GPU learner if available)
++    python training/train.py --run main --resume                # continue
++    python training/train.py --run main --export                # latest checkpoint -> submission/weights/policy.pt
++
++Design: one subprocess per CPU core runs doom_env + FeatureBuilder + reward shaping; the main
++process batches observations, samples actions on the GPU, and runs PPO with truncated BPTT over
++32-step chunks of the GRU.
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import multiprocessing as mp
++import os
++import sys
++import time
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++import torch
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "submission"))
++sys.path.insert(0, str(ROOT / "training"))
++
++from model.features import FeatureBuilder  # noqa: E402
++from model.policy import DoomPolicy  # noqa: E402
++
++KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map")
++KEYS_INT = ("ray_type", "ent_type")
++KEYS_U8 = ("rgb",)
++ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
++
++
++# ============================================================================ worker
++def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool):
++    os.environ["OMP_NUM_THREADS"] = "1"
++    import warnings
++
++    warnings.filterwarnings("ignore")
++    from doom_env import make_env
++
++    import maps
++    from rewards import Shaper
++
++    rng = np.random.default_rng(seed)
++    pool = maps.build_pool("train")
++    env, fb, shaper = None, FeatureBuilder(), Shaper()
++    env_steps, eps_left, cur = 0, 0, None
++    bad: set = set()
++
++    def new_episode():
++        nonlocal env, eps_left, cur
++        while True:
++            if env is None or eps_left <= 0:
++                if env is not None:
++                    env.close()
++                    env = None
++                cand = maps.sample(pool, env_steps, rng)
++                if (cand[0], cand[1]) in bad:
++                    continue
++                ticks = int(rng.choice([2100, 2800, 3500, 4200]))
++                try:
++                    env = make_env(cand[0], cand[1], episode_ticks=ticks, render_buffers=use_rgb)
++                except Exception as e:  # unloadable map: skip it forever
++                    print(f"[worker {idx}] skip {cand[1]} in {Path(cand[0]).name}: {e}", flush=True)
++                    bad.add((cand[0], cand[1]))
++                    env = None
++                    continue
++                cur, eps_left = cand, episodes_per_map
++            eps_left -= 1
++            try:
++                obs, _ = env.reset(seed=int(rng.integers(1 << 30)))
++            except Exception as e:
++                print(f"[worker {idx}] reset failed on {cur[1]}: {e}", flush=True)
++                bad.add((cur[0], cur[1]))
++                env.close()
++                env = None
++                continue
++            fb.reset()
++            shaper.reset(env)
++            return obs
++
++    obs = new_episode()
++    feats = fb.step(obs)
++    conn.send((feats, 0.0, True, None))
++    while True:
++        msg = conn.recv()
++        if msg is None:
++            break
++        action, env_steps = msg
++        fb.note_action(action)
++        obs, _, term, trunc, _ = env.step(action)
++        r = shaper.step(env, action, obs, term or trunc)
++        info = None
++        if term or trunc:
++            info = dict(shaper.stats, map=f"{Path(cur[0]).stem}:{cur[1]}")
++            obs = new_episode()
++            feats = fb.step(obs)
++            conn.send((feats, r, True, info))
++        else:
++            feats = fb.step(obs)
++            conn.send((feats, r, False, info))
++    if env is not None:
++        env.close()
++
++
++# ============================================================================ helpers
++class RunningStd:
++    def __init__(self):
++        self.n, self.mean, self.m2 = 1e-4, 0.0, 1.0
++
++    def update(self, x):
++        x = np.asarray(x, np.float64).ravel()
++        b_mean, b_var, b_n = x.mean(), x.var(), x.size
++        d = b_mean - self.mean
++        tot = self.n + b_n
++        self.mean += d * b_n / tot
++        self.m2 = (self.m2 * self.n + b_var * b_n + d * d * self.n * b_n / tot) / tot
++        self.n = tot
++
++    @property
++    def std(self):
++        return float(np.sqrt(self.m2) + 1e-6)
++
++
++def stack(feat_list):
++    return {k: np.stack([f[k] for f in feat_list]) for k in ALL_KEYS}
++
++
++def to_torch(batch: dict, device):
++    out = {}
++    for k, v in batch.items():
++        t = torch.from_numpy(v)
++        out[k] = t.to(device, non_blocking=True)
++    return out
++
++
++def bernoulli_logp_ent(logits, actions):
++    logp = -torch.nn.functional.binary_cross_entropy_with_logits(logits, actions, reduction="none").sum(-1)
++    p = torch.sigmoid(logits)
++    ent = torch.nn.functional.binary_cross_entropy_with_logits(logits, p, reduction="none").sum(-1)
++    return logp, ent
++
++
++# ============================================================================ main
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run", default="main")
++    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
++    ap.add_argument("--steps", type=int, default=128, help="rollout length per worker")
++    ap.add_argument("--chunk", type=int, default=32, help="BPTT length")
++    ap.add_argument("--epochs", type=int, default=3)
++    ap.add_argument("--minibatches", type=int, default=4)
++    ap.add_argument("--lr", type=float, default=2.5e-4)
++    ap.add_argument("--gamma", type=float, default=0.995)
++    ap.add_argument("--lam", type=float, default=0.95)
++    ap.add_argument("--clip", type=float, default=0.15)
++    ap.add_argument("--ent", type=float, default=0.03)
++    ap.add_argument("--ent-final", type=float, default=0.01)
++    ap.add_argument("--total", type=float, default=60e6, help="env steps for the schedules")
++    ap.add_argument("--episodes-per-map", type=int, default=3)
++    ap.add_argument("--no-rgb", action="store_true")
++    ap.add_argument("--resume", action="store_true")
++    ap.add_argument("--export", action="store_true")
++    ap.add_argument("--max-updates", type=int, default=10**9)
++    ap.add_argument("--save-every", type=int, default=20)
++    args = ap.parse_args()
++
++    run_dir = ROOT / "training" / "runs" / args.run
++    run_dir.mkdir(parents=True, exist_ok=True)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    use_rgb = not args.no_rgb
++    model = DoomPolicy(use_rgb=use_rgb).to(device)
++    opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
++    ret_std = RunningStd()
++    update, env_steps = 0, 0
++
++    latest = run_dir / "latest.pt"
++    if (args.resume or args.export) and latest.exists():
++        ck = torch.load(latest, map_location=device, weights_only=False)
++        model.load_state_dict(ck["model"])
++        opt.load_state_dict(ck["opt"])
++        update, env_steps = ck["update"], ck["env_steps"]
++        ret_std.n, ret_std.mean, ret_std.m2 = ck["ret_std"]
++        print(f"resumed update {update}, {env_steps / 1e6:.1f}M steps")
++    if args.export:
++        out = ROOT / "submission" / "weights" / "policy.pt"
++        torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
++                    "config": {"hidden": model.hidden, "use_rgb": use_rgb},
++                    "meta": {"update": update, "env_steps": env_steps}}, out)
++        print(f"exported -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
++        return
++
++    ctx = mp.get_context("spawn")
++    conns, procs = [], []
++    seed0 = int(time.time()) % 100000
++    for i in range(args.workers):
++        a, b = ctx.Pipe()
++        p = ctx.Process(target=worker, args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb), daemon=True)
++        p.start()
++        conns.append(a)
++        procs.append(p)
++    N, T = args.workers, args.steps
++    first = [c.recv() for c in conns]
++    cur = stack([f[0] for f in first])
++    cur_first = np.ones(N, np.float32)
++    h = model.initial_state(N, device)
++
++    log_f = open(run_dir / "episodes.csv", "a", newline="")
++    log = csv.writer(log_f)
++    if log_f.tell() == 0:
++        log.writerow(["env_steps", "map", "ret", "exit", "death", "kills", "keys", "doors", "locked", "cells", "steps", "dmg"])
++    recent = deque(maxlen=200)
++    try:
++        from torch.utils.tensorboard import SummaryWriter
++        tb = SummaryWriter(str(run_dir / "tb"))
++    except Exception:
++        tb = None
++
++    t_start = time.time()
++    disc_ret = np.zeros(N, np.float64)
++    while update < args.max_updates:
++        t0 = time.time()
++        buf = {k: np.zeros((T, N) + cur[k].shape[1:], cur[k].dtype) for k in ALL_KEYS}
++        acts = np.zeros((T, N, 9), np.float32)
++        logps = np.zeros((T, N), np.float32)
++        vals = np.zeros((T + 1, N), np.float32)
++        rews = np.zeros((T, N), np.float32)
++        firsts = np.zeros((T + 1, N), np.float32)
++        h_chunks = []
++        model.eval()
++        for t in range(T):
++            if t % args.chunk == 0:
++                h_chunks.append(h.clone())
++            for k in ALL_KEYS:
++                buf[k][t] = cur[k]
++            firsts[t] = cur_first
++            with torch.no_grad():
++                x = {k: v.unsqueeze(0) for k, v in to_torch(cur, device).items()}
++                d = torch.from_numpy(cur_first).to(device).unsqueeze(0)
++                logits, v, h = model(x, h, d)
++                logits = logits[0]
++                a = torch.bernoulli(torch.sigmoid(logits))
++                lp, _ = bernoulli_logp_ent(logits, a)
++            a_np = a.cpu().numpy().astype(np.int8)
++            acts[t] = a_np
++            logps[t] = lp.cpu().numpy()
++            vals[t] = v[0].cpu().numpy()
++            for i, c in enumerate(conns):
++                c.send((a_np[i], env_steps))
++            res = [c.recv() for c in conns]
++            cur = stack([r[0] for r in res])
++            rews[t] = [r[1] for r in res]
++            cur_first = np.array([r[2] for r in res], np.float32)
++            for r in res:
++                if r[3] is not None:
++                    info = r[3]
++                    recent.append(info)
++                    log.writerow([env_steps, info["map"], round(info["ret"], 2), info["exit"], info["death"], info["kills"],
++                                  info["keys"], info["doors"], info["locked"], info["cells"], info["steps"], round(info["dmg"])])
++            env_steps += N
++        with torch.no_grad():
++            x = {k: v.unsqueeze(0) for k, v in to_torch(cur, device).items()}
++            d = torch.from_numpy(cur_first).to(device).unsqueeze(0)
++            _, v, _ = model(x, h, d)
++            vals[T] = v[0].cpu().numpy()
++        firsts[T] = cur_first
++        t_roll = time.time() - t0
++
++        # ---- returns / advantages (value is in normalised units)
++        for t in range(T):  # scale rewards by the spread of discounted returns (standard PPO practice)
++            disc_ret = disc_ret * args.gamma * (1.0 - firsts[t]) + rews[t]
++            ret_std.update(disc_ret)
++        r_n = np.clip(rews / ret_std.std, -10, 10)
++        adv = np.zeros((T, N), np.float32)
++        last = 0.0
++        for t in reversed(range(T)):
++            nonterm = 1.0 - firsts[t + 1]
++            delta = r_n[t] + args.gamma * vals[t + 1] * nonterm - vals[t]
++            last = delta + args.gamma * args.lam * nonterm * last
++            adv[t] = last
++        rets = adv + vals[:T]
++
++        # ---- PPO update over chunks of length L
++        frac = min(1.0, env_steps / args.total)
++        ent_coef = args.ent + (args.ent_final - args.ent) * frac
++        for g in opt.param_groups:
++            g["lr"] = args.lr * max(0.1, 1.0 - frac)
++        model.train()
++        L = args.chunk
++        n_chunks = T // L
++        tb_ = {k: torch.from_numpy(v).to(device) for k, v in buf.items()}
++        A = torch.from_numpy(acts).to(device)
++        LP = torch.from_numpy(logps).to(device)
++        ADV = torch.from_numpy(adv).to(device)
++        RET = torch.from_numpy(rets).to(device)
++        VOLD = torch.from_numpy(vals[:T]).to(device)
++        FIRST = torch.from_numpy(firsts[:T]).to(device)
++        H0 = torch.cat(h_chunks, 1)  # (1, n_chunks*N, H), chunk-major
++        seq_ids = np.arange(n_chunks * N)
++        stats = []
++        for _ in range(args.epochs):
++            np.random.shuffle(seq_ids)
++            for mb in np.array_split(seq_ids, args.minibatches):
++                ci, ei = mb // N, mb % N  # chunk index, env index
++                tt = (ci[None, :] * L + np.arange(L)[:, None])  # (L, M)
++                ee = np.broadcast_to(ei[None, :], tt.shape)
++                tt_t, ee_t = torch.from_numpy(tt).to(device), torch.from_numpy(np.ascontiguousarray(ee)).to(device)
++                x = {k: v[tt_t, ee_t] for k, v in tb_.items()}
++                h0 = H0[:, torch.from_numpy(mb).to(device)]
++                logits, v, _ = model(x, h0, FIRST[tt_t, ee_t])
++                lp, ent = bernoulli_logp_ent(logits, A[tt_t, ee_t])
++                ratio = torch.exp(lp - LP[tt_t, ee_t])
++                adv_b = ADV[tt_t, ee_t]
++                adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
++                pg = -torch.min(ratio * adv_b, ratio.clamp(1 - args.clip, 1 + args.clip) * adv_b).mean()
++                v_old = VOLD[tt_t, ee_t]
++                v_clip = v_old + (v - v_old).clamp(-0.2, 0.2)
++                ret_b = RET[tt_t, ee_t]
++                vf = 0.5 * torch.max((v - ret_b) ** 2, (v_clip - ret_b) ** 2).mean()
++                loss = pg + 0.5 * vf - ent_coef * ent.mean()
++                opt.zero_grad(set_to_none=True)
++                loss.backward()
++                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
++                opt.step()
++                with torch.no_grad():
++                    kl = ((ratio - 1) - torch.log(ratio)).mean().item()
++                stats.append((pg.item(), vf.item(), ent.mean().item(), kl))
++        update += 1
++        t_upd = time.time() - t0 - t_roll
++
++        s = np.mean(stats, 0)
++        sps = N * T / (time.time() - t0)
++        if recent:
++            m = {k: np.mean([e[k] for e in recent]) for k in ("ret", "exit", "death", "kills", "keys", "doors", "cells", "steps")}
++        else:
++            m = {}
++        print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
++              f"pg {s[0]:.3f} vf {s[1]:.3f} ent {s[2]:.2f} kl {s[3]:.4f} | "
++              + " ".join(f"{k} {v:.2f}" for k, v in m.items()), flush=True)
++        if tb is not None:
++            for k, v in m.items():
++                tb.add_scalar(f"ep/{k}", v, env_steps)
++            tb.add_scalar("train/sps", sps, env_steps)
++            tb.add_scalar("train/entropy", s[2], env_steps)
++            tb.add_scalar("train/kl", s[3], env_steps)
++        if update % args.save_every == 0:
++            ck = {"model": model.state_dict(), "opt": opt.state_dict(), "update": update, "env_steps": env_steps,
++                  "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": {"hidden": model.hidden, "use_rgb": use_rgb}}
++            torch.save(ck, run_dir / "latest.tmp")
++            os.replace(run_dir / "latest.tmp", latest)
++            if update % (args.save_every * 5) == 0:
++                torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
++                            "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
++                           run_dir / f"policy_{env_steps // 1_000_000:04d}M.pt")
++            log_f.flush()
++
++    for c in conns:
++        c.send(None)
++    print(f"done in {(time.time() - t_start) / 3600:.2f} h")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
