@@ -284,6 +284,10 @@ class FeatureBuilder:
             return float(self.map[C_VISITED, cy, cx])
         return 1.0
 
+    def cell_key(self) -> tuple[int, int]:
+        """The agent's current memory-map cell in start-relative coordinates (unaffected by recentring)."""
+        return int(math.floor(self.x / CELL)), int(math.floor(self.y / CELL))
+
     def _crop(self) -> np.ndarray:
         c, s = math.cos(self.heading), math.sin(self.heading)
         wx = self.x + self._crop_fwd * c - self._crop_left * s

@@ -15,14 +15,16 @@ R = dict(
     door=1.0,
     locked_door=4.0,
     cell=0.1,  # new 128x128-unit area visited
-    kill=1.0,
+    kill=0.3,  # was 1.0: 20-40 kills per map out-paid the exit, so the bot farmed fights
     damage=-0.02,  # per HP lost
     death=-5.0,
     item=0.1,
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
-    attack_no_target=-0.003,
+    attack_no_target=-0.003,  # ATTACK with no enemy near the crosshair
 )
+ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
+AIM_SIN = 0.2  # |sin(rel_angle)| below this counts as "near the crosshair" (~11.5 deg)
 CELL = 128.0
 PLAYER_HEIGHT = 56.0
 
@@ -47,6 +49,12 @@ class Shaper:
         if s["sector_floor"] is None or len(self.door_ids) == 0:
             return np.zeros(len(self.door_ids), bool)
         return (s["sector_ceiling"][self.door_ids] - s["sector_floor"][self.door_ids]) >= PLAYER_HEIGHT
+
+    @staticmethod
+    def _enemy_in_sights(obs) -> bool:
+        ent = obs["visible_entities"]
+        enemy = (np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)
+        return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
 
     def step(self, env, action, obs, terminated: bool) -> float:
         s = env.privileged_state()
@@ -87,7 +95,7 @@ class Shaper:
         if use and not self.prev_use:
             r += R["use_press"]
         self.prev_use = use
-        if action[6] and not obs["visible_entities"]["mask"].any():
+        if action[6] and not self._enemy_in_sights(obs):
             r += R["attack_no_target"]
         self.prev = s
         st["ret"] += r
