@@ -15,6 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from doom_env import make_env
+from combat_maps import build_exit_lessons
 from keycard_curriculum import PRACTICE_LAYOUTS, build_practice_map
 from maps import build_pool
 from train import DoomPolicy, FeatureBuilder, ROOT, RunningStd, stack, to_torch
@@ -84,14 +85,14 @@ def collect_episode(path, route, seed, use_rgb, *, student=None, rng=None, recov
 
 
 @torch.inference_mode()
-def collect_combat(reference, seed, device, exclusive_movement=False, weapon_discipline=False):
+def collect_combat(reference, seed, device, exclusive_movement=False, weapon_discipline=False, render_rgb=False):
     """Keep examples of the previous policy's combat actions on training maps."""
     scenarios = {"basic", "defend_the_center", "deadly_corridor", "rocket_basic"}
     episodes = []
     for wad, map_name, _ in build_pool("train"):
         if Path(wad).stem not in scenarios:
             continue
-        with closing(make_env(wad, map_name, episode_ticks=768, render_buffers=reference.use_rgb)) as env:
+        with closing(make_env(wad, map_name, episode_ticks=768, render_buffers=reference.use_rgb or render_rgb)) as env:
             for offset in range(2):
                 observation, _ = env.reset(seed=seed + offset)
                 features = FeatureBuilder()
@@ -176,6 +177,8 @@ def main():
     parser.add_argument("--combat-reference", type=Path, help="retain examples from a prior combat policy")
     parser.add_argument("--recovery-rate", type=float, default=0.0,
                         help="probability of letting the initial policy act in a recovery rollout")
+    parser.add_argument("--arena-exits", action="store_true", help="add post-combat exit routes on practice arenas")
+    parser.add_argument("--enable-rgb", action="store_true", help="train the visual encoder while retaining initial policy outputs")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -189,10 +192,17 @@ def main():
     rng = np.random.default_rng(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     checkpoint = torch.load(args.init, map_location="cpu", weights_only=True) if args.init else None
-    config = checkpoint["config"] if checkpoint else {"hidden": 512, "use_rgb": False}
+    config = dict(checkpoint["config"]) if checkpoint else {"hidden": 512, "use_rgb": False}
+    add_visual_input = args.enable_rgb and not config["use_rgb"]
+    config["use_rgb"] = config["use_rgb"] or args.enable_rgb
     model = DoomPolicy(hidden=config["hidden"], use_rgb=config["use_rgb"]).to(device)
     if checkpoint:
         model.load_state_dict(checkpoint["model"])
+    if add_visual_input and checkpoint:
+        # Rays, entities and memory occupy the first 640 fusion columns.
+        # Start the visual contribution at zero so warm-start logits stay identical.
+        with torch.no_grad():
+            model.fuse[0].weight[:, 640:896].zero_()
     run = ROOT / "training" / "runs" / args.run
     episodes = []
     recovered = []
@@ -218,15 +228,24 @@ def main():
     if args.recovery_rate:
         print(f"adding {len(recovered)}/{2 * len(PRACTICE_LAYOUTS)} completed recovery episodes", flush=True)
         episodes.extend(recovered)
+    if args.arena_exits:
+        arena_episodes = []
+        for path, route in build_exit_lessons(run / "exit_maps"):
+            episode = collect_episode(path, route, args.seed, model.use_rgb)
+            if episode is not None:
+                arena_episodes.append(episode)
+        if not arena_episodes:
+            raise RuntimeError("No successful exit lessons on the cleared practice arenas")
+        print(f"adding {len(arena_episodes)} completed arena exit lessons", flush=True)
+        episodes.extend(arena_episodes)
     if args.combat_reference:
         prior = torch.load(args.combat_reference, map_location="cpu", weights_only=True)
-        if prior["config"]["use_rgb"] != model.use_rgb:
-            parser.error("--combat-reference must use the same RGB setting as the initial policy")
         reference = DoomPolicy(hidden=prior["config"]["hidden"], use_rgb=prior["config"]["use_rgb"]).to(device)
         reference.load_state_dict(prior["model"])
         combat = collect_combat(reference.eval(), args.seed, device,
                                 exclusive_movement=prior["config"].get("exclusive_movement", False),
-                                weapon_discipline=prior["config"].get("weapon_discipline", False))
+                                weapon_discipline=prior["config"].get("weapon_discipline", False),
+                                render_rgb=model.use_rgb)
         print(f"adding {len(combat)} combat episodes from the reference policy", flush=True)
         episodes.extend(combat)
     print(f"training on {len(episodes)} episodes, {sum(len(actions) for _, actions in episodes)} decisions", flush=True)
@@ -235,6 +254,7 @@ def main():
     # Reuse the PPO trainer's resume format with a fresh optimizer and reward scale.
     optimizer = torch.optim.Adam(model.parameters(), lr=2.5e-4, eps=1e-5)
     reward_scale = RunningStd()
+    config["combat_head_only"] = False
     torch.save({"model": model.state_dict(), "opt": optimizer.state_dict(), "update": 0, "env_steps": 0,
                 "ret_std": (reward_scale.n, reward_scale.mean, reward_scale.m2), "config": config},
                run / "latest.pt")

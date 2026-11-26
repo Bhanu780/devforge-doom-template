@@ -248,3 +248,26 @@ DOOM_GROUPS=arena=0.35,progression=0.35,small=0.10,fd_early=0.10,fd=0.10 \
 Seed each comparison run with a separate copy of the same starting checkpoint.
 Use `--no-combat-head-only` for the full-policy comparison. Evaluate candidates
 on the same reserved arenas, keycard layouts, and Freedoom maps.
+
+## Teach exit navigation from more starting points
+
+The exit lessons use cleared practice arenas so the model can learn movement
+after an encounter as a separate skill. Each floor plan has several start
+positions and headings. Only the demonstration collector follows those routes.
+The neural policy is evaluated through the same observation-only entry point.
+
+Enable RGB and depth in a separate warm-start experiment. The visual input
+starts with zero contribution to the existing policy, then learns during
+imitation. Rehearsing earlier combat decisions keeps combat examples in the
+training batches.
+
+```bash
+python training/imitate_keycard.py --run arena_exit_rgb \
+  --init training/runs/arenas_combat_only/candidate.pt \
+  --combat-reference training/runs/arenas_full_policy/candidate.pt \
+  --enable-rgb --arena-exits --epochs 5
+python training/train.py --run arena_exit_rgb --export --export-path training/runs/arena_exit_rgb/candidate.pt
+```
+
+Compare the finished checkpoint on the reserved arena floor plans, keycard maps,
+and broader Freedoom suite before continuing PPO or promoting it.
