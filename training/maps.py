@@ -56,9 +56,11 @@ def _maps_in(wad: Path) -> list[str]:
         return []
 
 
-def build_pool(split: str = "train", practice_maps: Path | None = None) -> list[tuple[str, str, str]]:
+def build_pool(split: str = "train", practice_maps: Path | None = None, arena_maps: Path | None = None) -> list[tuple[str, str, str]]:
+    if split == "public":
+        return [entry for entry in build_pool("train") + build_pool("val") if entry[2] != "hard"]
     if split == "progression":
-        return [entry for entry in build_pool("train", practice_maps) if entry[2] in ("progression", "hard")]
+        return [entry for entry in build_pool("train", practice_maps, arena_maps) if entry[2] in ("progression", "hard")]
     if split == "hard":  # held-out generated levels only
         return _hard_pool(HARD_VAL_DIR)
     pool: list[tuple[str, str, str]] = []
@@ -81,6 +83,9 @@ def build_pool(split: str = "train", practice_maps: Path | None = None) -> list[
         if practice_maps is not None:
             for wad in sorted(practice_maps.glob("*.wad")):
                 pool.extend((str(wad), m, "progression") for m in _maps_in(wad))
+        if arena_maps is not None:
+            for wad in sorted(arena_maps.glob("*.wad")):
+                pool.extend((str(wad), m, "arena") for m in _maps_in(wad))
         pool.extend(_hard_pool(HARD_DIR))
         if EXTRA_DIR.exists():
             for wad in sorted(EXTRA_DIR.glob("*.wad")):
@@ -97,10 +102,10 @@ def group_weights(env_steps: int) -> dict[str, float]:
     if override:
         return {k: float(v) for k, v in (kv.split("=") for kv in override.split(","))}
     if env_steps < 3_000_000:
-        return {"progression": 0.15, "hard": 0.15, "small": 0.35, "fd_early": 0.35, "fd": 0.0}
+        return {"arena": 0.25, "progression": 0.15, "hard": 0.15, "small": 0.30, "fd_early": 0.40, "fd": 0.05}
     if env_steps < 8_000_000:
-        return {"progression": 0.08, "hard": 0.17, "small": 0.20, "fd_early": 0.30, "fd": 0.25}
-    return {"progression": 0.05, "hard": 0.15, "small": 0.15, "fd_early": 0.20, "fd": 0.45}
+        return {"arena": 0.20, "progression": 0.08, "hard": 0.15, "small": 0.15, "fd_early": 0.35, "fd": 0.35}
+    return {"arena": 0.15, "progression": 0.05, "hard": 0.12, "small": 0.10, "fd_early": 0.25, "fd": 0.55}
 
 
 def sample(pool, env_steps: int, rng: np.random.Generator):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from copy import deepcopy
 import math
 import multiprocessing as mp
 import os
@@ -28,18 +29,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "submission"))
 sys.path.insert(0, str(ROOT / "training"))
 
+from model.actions import mask_distant_punches, movement_logits, sample_exclusive  # noqa: E402
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
-KEYS_FLOAT = ("ray_dist", "ent_feat", "ent_mask", "extra", "map", "act_mask")
-KEYS_INT = ("ray_type", "ent_type")
-KEYS_U8 = ("rgb",)
-ALL_KEYS = KEYS_FLOAT + KEYS_INT + KEYS_U8
-
-
 # ============================================================================ worker
 def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
-           curiosity: float, progression_only: bool, practice_maps: Path | None):
+           curiosity: float, progression_only: bool, practice_maps: Path | None,
+           weapon_discipline: bool, loaded_switch_cost: float, arena_maps: Path | None,
+           collision_aware: bool, height_safe_shaping: bool):
     os.environ["OMP_NUM_THREADS"] = "1"
     import warnings
 
@@ -50,9 +48,12 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
     from rewards import Shaper
 
     rng = np.random.default_rng(seed)
-    pool = maps.build_pool("progression" if progression_only else "train", practice_maps)
+    pool = maps.build_pool("progression" if progression_only else "train", practice_maps, arena_maps)
     map_index = idx
-    env, fb, shaper = None, FeatureBuilder(), Shaper()
+    env = None
+    fb = FeatureBuilder(include_rgb=use_rgb, collision_aware=collision_aware)
+    shaper = Shaper(weapon_discipline, loaded_switch_cost, recovery_feedback=collision_aware,
+                    height_safe_shaping=height_safe_shaping)
     env_steps, eps_left, cur = 0, 0, None
     bad: set = set()
 
@@ -91,7 +92,7 @@ def worker(idx: int, conn, seed: int, episodes_per_map: int, use_rgb: bool,
                 env = None
                 continue
             fb.reset()
-            shaper.reset(env)
+            shaper.reset(env, obs)
             entries.clear()
             last_cell[0] = None
             return obs
@@ -162,7 +163,7 @@ class RunningStd:
 
 
 def stack(feat_list):
-    return {k: np.stack([f[k] for f in feat_list]) for k in ALL_KEYS}
+    return {k: np.stack([f[k] for f in feat_list]) for k in feat_list[0]}
 
 
 def to_torch(batch: dict, device):
@@ -178,6 +179,42 @@ def bernoulli_logp_ent(logits, actions):
     p = torch.sigmoid(logits)
     ent = torch.nn.functional.binary_cross_entropy_with_logits(logits, p, reduction="none").sum(-1)
     return logp, ent
+
+
+def exclusive_logp_ent(logits, actions):
+    movement = torch.distributions.Categorical(logits=movement_logits(logits), validate_args=False)
+    choices = actions[..., :6:2].long() + 2 * actions[..., 1:6:2].long()
+    logp, entropy = bernoulli_logp_ent(logits[..., 6:], actions[..., 6:])
+    return logp + movement.log_prob(choices).sum(-1), entropy + movement.entropy().sum(-1)
+
+
+def navigation_kl(current, reference, exclusive):
+    """KL from the starting policy over movement and Use actions."""
+    def binary_kl(logits, old_logits):
+        targets = old_logits.sigmoid()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits
+        return (loss(logits, targets, reduction="none") - loss(old_logits, targets, reduction="none")).sum(dim=-1)
+
+    if not exclusive:
+        buttons = [0, 1, 2, 3, 4, 5, 7]
+        return binary_kl(current[..., buttons], reference[..., buttons]).mean()
+    current_moves = movement_logits(current).log_softmax(dim=-1)
+    reference_moves = movement_logits(reference).log_softmax(dim=-1)
+    move_kl = (reference_moves.exp() * (reference_moves - current_moves)).sum(dim=(-1, -2))
+    return (move_kl + binary_kl(current[..., 7:8], reference[..., 7:8])).mean()
+
+
+def combat_parameters(model):
+    """Update attack and next-weapon outputs while keeping the navigation policy fixed."""
+    model.requires_grad_(False)
+    model.v.requires_grad_(True)
+    output = model.pi[-1]
+    output.requires_grad_(True)
+    keep = torch.zeros_like(output.bias)
+    keep[[6, 8]] = 1
+    output.bias.register_hook(lambda gradient: gradient * keep)
+    output.weight.register_hook(lambda gradient: gradient * keep[:, None])
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
 # ============================================================================ main
@@ -200,17 +237,43 @@ def main():
     ap.add_argument("--episodes-per-map", type=int, default=3)
     ap.add_argument("--progression-only", action="store_true", help="cycle through door and keycard practice maps")
     ap.add_argument("--practice-maps", type=Path, help="add generated WADs to the progression curriculum")
+    ap.add_argument("--arena-maps", type=Path, help="add generated combat arenas to the map pool")
+    ap.add_argument("--combat-head-only", action=argparse.BooleanOptionalAction, default=None,
+                    help="fine-tune attack and weapon outputs plus the critic")
+    ap.add_argument("--loaded-switch-cost", type=float, default=0.05, help="training penalty for cycling a loaded weapon under fire")
+    ap.add_argument("--navigation-anchor", type=float, default=0.0,
+                    help="penalize drift in movement and Use from this run's starting policy")
+    ap.add_argument("--weapon-discipline", action="store_true", help="train with melee feasibility and combat feedback")
+    ap.add_argument("--collision-aware", action="store_true",
+                    help="use ray-corrected stall observations and train with wall recovery and tighter aim feedback")
+    ap.add_argument("--height-safe-shaping", action="store_true",
+                    help="skip planar exit-distance rewards on maps with steep ledges")
+    ap.add_argument("--exclusive-movement", action="store_true", help="learn one choice per opposing movement pair")
     ap.add_argument("--curiosity", type=float, default=0.05, help="intrinsic bonus per memory-map cell entry, / sqrt(entries) (0 = off)")
     ap.add_argument("--no-rgb", action="store_true")
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--export", action="store_true")
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument("--resume", action="store_true")
+    source.add_argument("--export", action="store_true")
+    source.add_argument("--init-weights", type=Path, help="start a new run from a policy export with a fresh optimizer")
     ap.add_argument("--export-path", type=Path, default=ROOT / "submission" / "weights" / "policy.pt")
     ap.add_argument("--max-updates", type=int, default=10**9)
     ap.add_argument("--save-every", type=int, default=20)
     args = ap.parse_args()
 
+    if not math.isfinite(args.navigation_anchor) or args.navigation_anchor < 0:
+        ap.error("--navigation-anchor must be finite and nonnegative")
+    if args.save_every < 1 or args.max_updates < 1:
+        ap.error("--save-every and --max-updates must be positive")
+    if not math.isfinite(args.loaded_switch_cost) or args.loaded_switch_cost < 0:
+        ap.error("--loaded-switch-cost must be finite and nonnegative")
+    if args.combat_head_only and not (args.resume or args.init_weights):
+        ap.error("--combat-head-only needs trained weights via --resume or --init-weights")
     if args.practice_maps is not None and not any(args.practice_maps.glob("*.wad")):
         ap.error("--practice-maps must contain at least one WAD")
+    if args.arena_maps is not None and not any(args.arena_maps.glob("*.wad")):
+        ap.error("--arena-maps must contain at least one WAD")
+    if args.progression_only and args.arena_maps is not None:
+        ap.error("--arena-maps requires the mixed curriculum")
     if args.episodes_per_map < 1:
         ap.error("--episodes-per-map must be positive")
     if args.workers < 1 or args.chunk < 1 or args.steps < 1 or args.steps % args.chunk:
@@ -223,21 +286,44 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_rgb = not args.no_rgb
+    exclusive_movement = args.exclusive_movement
+    weapon_discipline = args.weapon_discipline
+    collision_aware = args.collision_aware
+    height_safe_shaping = args.height_safe_shaping
     latest = run_dir / "latest.pt"
     ck = None
-    if args.resume or args.export:
-        if not latest.is_file():
-            ap.error(f"missing trained checkpoint: {latest}")
-        ck = torch.load(latest, map_location=device, weights_only=False)
+    input_weights = latest if args.resume or args.export else args.init_weights
+    if input_weights is not None:
+        if not input_weights.is_file():
+            ap.error(f"missing trained checkpoint: {input_weights}")
+        if args.init_weights and latest.exists():
+            ap.error(f"run already has a checkpoint: {latest}. Choose a new --run or use --resume.")
+        ck = torch.load(input_weights, map_location=device, weights_only=False)
         use_rgb = ck["config"]["use_rgb"]
-    model = DoomPolicy(use_rgb=use_rgb).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+        exclusive_movement = exclusive_movement or ck["config"].get("exclusive_movement", False)
+        weapon_discipline = weapon_discipline or ck["config"].get("weapon_discipline", False)
+        collision_aware = collision_aware or ck["config"].get("collision_aware", False)
+        height_safe_shaping = height_safe_shaping or (args.resume and ck["config"].get("height_safe_shaping", False))
+    prior_combat_only = bool(ck and ck["config"].get("combat_head_only", False))
+    combat_only = prior_combat_only if args.combat_head_only is None else args.combat_head_only
+    model = DoomPolicy(use_rgb=use_rgb, hidden=ck["config"].get("hidden", 512) if ck else 512).to(device)
+    config = {"hidden": model.hidden, "use_rgb": use_rgb, "exclusive_movement": exclusive_movement,
+              "weapon_discipline": weapon_discipline, "combat_head_only": combat_only,
+              "collision_aware": collision_aware, "height_safe_shaping": height_safe_shaping}
+    action_stats = exclusive_logp_ent if exclusive_movement else bernoulli_logp_ent
+    parameters = combat_parameters(model) if combat_only else model.parameters()
+    opt = torch.optim.Adam(parameters, lr=args.lr, eps=1e-5)
     ret_std = RunningStd()
     update, env_steps = 0, 0
 
     if ck is not None:
         model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
+    if args.init_weights:
+        print(f"initialized policy from {args.init_weights} with a fresh optimizer", flush=True)
+    elif ck is not None:
+        # Optimizer moments from full-policy training could update frozen action rows.
+        if not args.export and combat_only == prior_combat_only:
+            opt.load_state_dict(ck["opt"])
         update, env_steps = ck["update"], ck["env_steps"]
         ret_std.n, ret_std.mean, ret_std.m2 = ck["ret_std"]
         print(f"resumed update {update}, {env_steps / 1e6:.1f}M steps")
@@ -245,10 +331,19 @@ def main():
         out = args.export_path
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
-                    "config": {"hidden": model.hidden, "use_rgb": use_rgb},
+                    "config": config,
                     "meta": {"update": update, "env_steps": env_steps}}, out)
         print(f"exported -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
         return
+
+    anchor = None
+    if args.navigation_anchor:
+        anchor = deepcopy(model).requires_grad_(False).eval()
+        anchor_path = run_dir / "navigation_anchor.pt"
+        if anchor_path.is_file():
+            anchor.load_state_dict(torch.load(anchor_path, map_location=device, weights_only=True))
+        else:
+            torch.save(anchor.state_dict(), anchor_path)
 
     import maps
 
@@ -261,7 +356,9 @@ def main():
         p = ctx.Process(
             target=worker,
             args=(i, b, seed0 + 7919 * i, args.episodes_per_map, use_rgb,
-                  args.curiosity, args.progression_only, args.practice_maps),
+                  args.curiosity, args.progression_only, args.practice_maps,
+                  weapon_discipline, args.loaded_switch_cost, args.arena_maps, collision_aware,
+                  height_safe_shaping),
             daemon=True,
         )
         p.start()
@@ -271,8 +368,10 @@ def main():
     N, T = args.workers, args.steps
     first = [c.recv() for c in conns]
     cur = stack([f[0] for f in first])
+    rollout_keys = tuple(cur)
     cur_first = np.ones(N, np.float32)
     h = model.initial_state(N, device)
+    anchor_hidden = anchor.initial_state(N, device) if anchor is not None else None
 
     log_f = open(run_dir / "episodes.csv", "a", newline="")
     log = csv.writer(log_f)
@@ -282,14 +381,15 @@ def main():
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb = SummaryWriter(str(run_dir / "tb"))
-    except Exception:
+    except ImportError:
         tb = None
+        print("TensorBoard is unavailable; metrics are still written to episodes.csv.", flush=True)
 
     t_start = time.time()
     disc_ret = np.zeros(N, np.float64)
     while update < args.max_updates:
         t0 = time.time()
-        buf = {k: np.zeros((T, N) + cur[k].shape[1:], cur[k].dtype) for k in ALL_KEYS}
+        buf = {k: np.zeros((T, N) + cur[k].shape[1:], cur[k].dtype) for k in rollout_keys}
         acts = np.zeros((T, N, 9), np.float32)
         logps = np.zeros((T, N), np.float32)
         vals = np.zeros((T + 1, N), np.float32)
@@ -303,16 +403,18 @@ def main():
             t_a = time.perf_counter()
             if t % args.chunk == 0:
                 h_chunks.append(h.clone())
-            for k in ALL_KEYS:
+            for k in rollout_keys:
                 buf[k][t] = cur[k]
             firsts[t] = cur_first
             with torch.no_grad():
                 x = {k: v.unsqueeze(0) for k, v in to_torch(cur, device).items()}
                 d = torch.from_numpy(cur_first).to(device).unsqueeze(0)
                 logits, v, h = model(x, h, d)
+                if weapon_discipline:
+                    logits = mask_distant_punches(logits, x)
                 logits = logits[0]
-                a = torch.bernoulli(torch.sigmoid(logits))
-                lp, _ = bernoulli_logp_ent(logits, a)
+                a = sample_exclusive(logits) if exclusive_movement else torch.bernoulli(logits.sigmoid())
+                lp, _ = action_stats(logits, a)
             a_np = a.cpu().numpy().astype(np.int8)
             acts[t] = a_np
             logps[t] = lp.cpu().numpy()
@@ -380,6 +482,10 @@ def main():
         RET = torch.from_numpy(rets).to(device)
         VOLD = torch.from_numpy(vals[:T]).to(device)
         FIRST = torch.from_numpy(firsts[:T]).to(device)
+        anchor_logits = None
+        if anchor is not None:
+            with torch.no_grad():
+                anchor_logits, _, anchor_hidden = anchor(tb_, anchor_hidden, FIRST)
         H0 = torch.cat(h_chunks, 1)  # (1, n_chunks*N, H), chunk-major
         seq_ids = np.arange(n_chunks * N)
         stats = []
@@ -393,7 +499,9 @@ def main():
                 x = {k: v[tt_t, ee_t] for k, v in tb_.items()}
                 h0 = H0[:, torch.from_numpy(mb).to(device)]
                 logits, v, _ = model(x, h0, FIRST[tt_t, ee_t])
-                lp, ent = bernoulli_logp_ent(logits, A[tt_t, ee_t])
+                if weapon_discipline:
+                    logits = mask_distant_punches(logits, x)
+                lp, ent = action_stats(logits, A[tt_t, ee_t])
                 ratio = torch.exp(lp - LP[tt_t, ee_t])
                 adv_b = ADV[tt_t, ee_t]
                 adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
@@ -402,14 +510,15 @@ def main():
                 v_clip = v_old + (v - v_old).clamp(-0.2, 0.2)
                 ret_b = RET[tt_t, ee_t]
                 vf = 0.5 * torch.max((v - ret_b) ** 2, (v_clip - ret_b) ** 2).mean()
-                loss = pg + 0.5 * vf - ent_coef * ent.mean()
+                anchor_loss = navigation_kl(logits, anchor_logits[tt_t, ee_t], exclusive_movement) if anchor_logits is not None else logits.new_zeros(())
+                loss = pg + 0.5 * vf - ent_coef * ent.mean() + args.navigation_anchor * anchor_loss
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 opt.step()
                 with torch.no_grad():
                     kl = ((ratio - 1) - torch.log(ratio)).mean().item()
-                stats.append((pg.item(), vf.item(), ent.mean().item(), kl))
+                stats.append((pg.item(), vf.item(), ent.mean().item(), kl, anchor_loss.item()))
         update += 1
         t_upd = time.time() - t0 - t_roll
 
@@ -423,7 +532,7 @@ def main():
             print(f"  timing per step: policy {1000 * t_policy / T:.1f} ms | wait for workers {1000 * t_wait / T:.1f} ms "
                   f"(slowest worker's own work {1000 * t_work_max / T:.1f} ms, average {1000 * t_work_mean / T:.1f} ms, "
                   f"so ~{1000 * (t_wait - t_work_max) / T:.1f} ms is messaging/CPU contention)", flush=True)
-        print(f"upd {update} steps {env_steps / 1e6:.2f}M sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
+        print(f"upd {update} steps {env_steps:,} sps {sps:.0f} (roll {t_roll:.1f}s upd {t_upd:.1f}s) "
               f"pg {s[0]:.3f} vf {s[1]:.3f} ent {s[2]:.2f} kl {s[3]:.4f} | "
               + " ".join(f"{k} {v:.2f}" for k, v in m.items()), flush=True)
         if tb is not None:
@@ -432,19 +541,24 @@ def main():
             tb.add_scalar("train/sps", sps, env_steps)
             tb.add_scalar("train/entropy", s[2], env_steps)
             tb.add_scalar("train/kl", s[3], env_steps)
-        if update % args.save_every == 0:
+            if anchor is not None:
+                tb.add_scalar("train/navigation_kl", s[4], env_steps)
+        if update % args.save_every == 0 or update == args.max_updates:
             ck = {"model": model.state_dict(), "opt": opt.state_dict(), "update": update, "env_steps": env_steps,
-                  "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": {"hidden": model.hidden, "use_rgb": use_rgb}}
+                  "ret_std": (ret_std.n, ret_std.mean, ret_std.m2), "config": config}
             torch.save(ck, run_dir / "latest.tmp")
             os.replace(run_dir / "latest.tmp", latest)
             if update % (args.save_every * 5) == 0:
                 torch.save({"model": {k: v.half().cpu() for k, v in model.state_dict().items()},
                             "config": ck["config"], "meta": {"update": update, "env_steps": env_steps}},
-                           run_dir / f"policy_{env_steps / 1e6:05.2f}M.pt")  # e.g. policy_03.38M.pt: unique per snapshot
+                           run_dir / f"policy_{env_steps / 1e6:05.2f}M.pt")
             log_f.flush()
 
     for c in conns:
         c.send(None)
+    log_f.close()
+    if tb is not None:
+        tb.close()
     print(f"done in {(time.time() - t_start) / 3600:.2f} h")
 
 

@@ -13,13 +13,21 @@ LAYOUT = (
     "#P.+.E#",
     "#######",
 )
+BENT_LAYOUT = (
+    "##########",
+    "###..K####",
+    "###.######",
+    "###.######",
+    "#P...+..E#",
+    "##########",
+)
 CELL = 128
-
 # Tile codes. "K" / "+" are the original red key / red locked door.
 KEY_THINGS = {"K": 13, "R": 13, "B": 5, "Y": 6}  # red, red, blue, yellow keycards
 DOOR_LOCKS = {"+": 1, "r": 1, "b": 2, "y": 3, "D": 0}  # ZDoom lock numbers; 0 = plain door
-MONSTER_THINGS = {"Z": 3004, "S": 9, "I": 3001}  # zombieman, shotgun guy, imp (all face west)
+MONSTER_THINGS = {"Z": 3004, "S": 9, "I": 3001, "G": 9}  # zombieman, shotgun guy, imp (all face west)
 DOORS = set(DOOR_LOCKS)
+THING_TYPES = {"P": 1, "W": 2001, "A": 2008, "H": 2012, **KEY_THINGS, **MONSTER_THINGS}
 
 
 def sector_index(layout) -> dict[tuple[int, int], int]:
@@ -34,7 +42,7 @@ def cell_center(point: tuple[int, int]) -> tuple[float, float]:
 
 
 def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
-                      spawn_offset: tuple[int, int] = (0, 0)) -> None:
+                      spawn_offset: tuple[int, int] = (0, 0), *, monster_angle: int = 180) -> None:
     blocks = ['namespace = "zdoom";']
     vertices = {}
 
@@ -61,16 +69,15 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
     for (x, y), tile in tiles.items():
         add("sector", heightfloor=0, heightceiling=0 if tile in DOORS else 128,
             texturefloor="FLOOR4_8", textureceiling="CEIL3_5", lightlevel=192)
-        if tile == "P" or tile in KEY_THINGS or tile in MONSTER_THINGS:
+        if tile in THING_TYPES:
             px, py = cell_center((x, y))
             if tile == "P":
                 px += spawn_offset[0]
                 py += spawn_offset[1]
                 kind, angle = 1, spawn_angle
-            elif tile in KEY_THINGS:
-                kind, angle = KEY_THINGS[tile], 0
             else:
-                kind, angle = MONSTER_THINGS[tile], 180
+                kind = THING_TYPES[tile]
+                angle = monster_angle if tile in MONSTER_THINGS else 0
             add("thing", x=px, y=py, angle=angle, type=kind,
                 skill1=True, skill2=True, skill3=True, skill4=True, skill5=True, single=True)
 
@@ -109,4 +116,6 @@ def write_keycard_map(path: Path, layout=LAYOUT, spawn_angle: int = 0,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    write_keycard_map(parser.parse_args().output)
+    parser.add_argument("--layout", choices=("straight", "bent"), default="straight")
+    args = parser.parse_args()
+    write_keycard_map(args.output, BENT_LAYOUT if args.layout == "bent" else LAYOUT)

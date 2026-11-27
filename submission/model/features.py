@@ -95,7 +95,9 @@ class FeatureBuilder:
     """Stateful encoder. Call reset() at the start of each map and step(obs) once per decision,
     then note_action(action) with the action actually sent."""
 
-    def __init__(self):
+    def __init__(self, include_rgb: bool = True, collision_aware: bool = False):
+        self.include_rgb = include_rgb
+        self.collision_aware = collision_aware
         # Crop sampling offsets in the agent frame (x forward, y left), one per crop cell.
         # Row 0 = far ahead, column 0 = far left, so the crop shows ahead-up.
         idx = np.arange(CROP) - CROP / 2 + 0.5
@@ -151,12 +153,15 @@ class FeatureBuilder:
     def step(self, obs: dict) -> dict:
         """Update odometry and memory from a fresh observation; return policy inputs."""
         vit = np.asarray(obs["vitals"], np.float32)
+        fwd, right = float(vit[14]), float(vit[15])
+        speed = math.hypot(fwd, right)
         self._pending_turn_applied = getattr(self, "_pending_turn", 0.0)
         if self.steps > 0:
             self.heading += self._pending_turn_applied
             # Velocity is reported in the frame of the *new* heading after the step.
-            fwd, right = float(vit[14]), float(vit[15])
             fwd, right = self._unblock(obs, fwd, right)
+            if self.collision_aware:
+                speed = math.hypot(fwd, right)
             c, s = math.cos(self.heading), math.sin(self.heading)
             vx, vy = fwd * c + right * s, fwd * s - right * c  # world-frame velocity now
             self.x += W_CUR * vx + W_PREV * self.prev_vel[0]
@@ -165,8 +170,10 @@ class FeatureBuilder:
         self._pending_turn = 0.0
         self.steps += 1
 
-        speed = math.hypot(float(vit[14]), float(vit[15]))
-        self.stuck = self.stuck + 1 if (speed < 0.5 and self.prev_action[:4].any()) else 0
+        moving = self.prev_action[:4].any()
+        if self.collision_aware:
+            moving = self.prev_action[0] != self.prev_action[1] or self.prev_action[2] != self.prev_action[3]
+        self.stuck = self.stuck + 1 if speed < 0.5 and moving else 0
         hp = float(vit[0])
         if self.last_health is not None and hp < self.last_health:
             self.steps_since_damage = 0
@@ -196,7 +203,7 @@ class FeatureBuilder:
         extra[31] = 1.0  # bias
 
         ent = obs["visible_entities"]
-        return {
+        features = {
             "ray_dist": np.asarray(obs["rays"]["distance"], np.float32),
             "ray_type": np.asarray(obs["rays"]["hit_type"], np.int64),
             "ent_feat": np.clip(np.asarray(ent["features"], np.float32), -8, 8),
@@ -204,9 +211,11 @@ class FeatureBuilder:
             "ent_mask": np.asarray(ent["mask"], np.float32),
             "extra": extra,
             "map": self._crop(),
-            "rgb": rgb_small(obs),
             "act_mask": action_mask(obs),
         }
+        if self.include_rgb:
+            features["rgb"] = rgb_small(obs)
+        return features
 
     def _unblock(self, obs: dict, fwd: float, right: float) -> tuple[float, float]:
         """Doom keeps reporting momentum while the player pushes into a wall. Remove it:

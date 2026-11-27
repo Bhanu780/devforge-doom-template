@@ -9,37 +9,40 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from vizdoom import GameVariable
 
 import navfield
 
 R = dict(
     exit=20.0,
-    exit_health=0.05,  # per remaining HP at exit
+    exit_health=0.08,  # per remaining HP at exit (was 0.05: incentivize safer play to arrive healthier)
     key=5.0,
     door=1.0,
     locked_door=4.0,
-    cell=0.15,  # new 128x128-unit area visited (was 0.1)
+    cell=0.20,  # new 128x128-unit area visited (was 0.15: stronger exploration drive for large Freedoom maps)
     revisit=-0.03,  # per entry into a 128-unit area already entered twice, x min(entries - 2, 4): stops backtracking loops
     kill=0.3,  # was 1.0: 20-40 kills per map out-paid the exit, so the bot farmed fights
-    damage=-0.03,  # per HP lost, x (1 + 2 * missing-health fraction): 0.03/HP at full health, ~0.07/HP below 40 HP
-    death=-8.0,  # was -5: dying early also costs the scorer's survival points
-    health_gain=0.04,  # per HP healed, x (1 + 2 * missing-health fraction before the pickup); medkits never moved items
-    armor_gain=0.01,  # per armour point picked up
-    seek_health=0.002,  # below SEEK_HP: per map unit closer to the nearest visible health pickup (clipped per step)
-    under_fire_strafe=0.004,  # per step strafing while hit in the last UNDER_FIRE steps (dodging instead of face-tanking)
+    damage=-0.04,  # per HP lost (was -0.03: penalize taking damage more to reduce 54% death rate)
+    death=-10.0,  # was -8: dying early costs the scorer's survival points AND all further progression
+    health_gain=0.05,  # per HP healed (was 0.04: picking up health matters more with higher damage penalty)
+    armor_gain=0.015,  # per armour point picked up (was 0.01)
+    seek_health=0.003,  # below SEEK_HP: per map unit closer to the nearest visible health pickup (was 0.002)
+    under_fire_strafe=0.005,  # per step strafing while hit (was 0.004: dodging is critical for survival)
     item=0.1,
     step=-0.002,
     use_press=-0.02,  # discourages USE spam (it bounces doors)
-    attack_no_target=-0.02,  # ATTACK with no enemy near the crosshair (was -0.003: the bot emptied its pistol into walls)
+    use_reverse_door=-0.25,  # pressing USE on an already-opening door reverses it in Doom
+    attack_no_target=-0.02,  # ATTACK with no enemy near the crosshair
+    pistol_spread=-0.015,  # holding continuous fire on pistol spreads shots and lowers accuracy
     ammo_wasted=-0.05,  # per round of ammo spent while no enemy is visible at all
-    stall=-0.02,  # per step while the player has moved < STALL_DIST units over the last STALL_STEPS steps
-    fists_with_ammo=-0.03,  # per step on fists while bullets or shells remain (was fists_vs_far, only for distant enemies)
-    bump=-0.01,  # per step holding FORWARD but moving < BUMP_DIST (stairs, angled walls), no enemy in view
-    jitter=-0.01,  # turn direction reversed from the previous step with no enemy in view (wall-scrape dithering)
+    stall=-0.025,  # per step while the player has moved < STALL_DIST units (was -0.02: punish standing still harder)
+    hit_damage=0.008,  # credit landed damage while keeping exits more valuable
+    fists_with_ammo=-0.03,  # per step on fists while bullets or shells remain
+    bump=-0.012,  # per step holding FORWARD but moving < BUMP_DIST (was -0.01)
+    jitter=-0.012,  # turn direction reversed from the previous step with no enemy in view (was -0.01)
     # Potential-based shaping on walking distance to the exit (through missing keys), see navfield.py:
-    # +k per map unit closer, -k per unit farther, 0 standing still; telescopes, so loops can't farm it.
-    exit_dist=0.002,
-    exit_dist_clip=0.5,  # per step; teleports and unmodelled lifts make the distance jump  # per step holding fists while a gun has ammo and an enemy is out of reach
+    exit_dist=0.003,  # (was 0.002: stronger pull toward exits for bigger Freedoom maps)
+    exit_dist_clip=0.6,  # per step; teleports and unmodelled lifts make the distance jump (was 0.5)
 )
 ENEMY_TYPES = (1, 2, 3)  # doom_env.spaces.ENTITY_TYPES: enemy_melee, enemy_hitscan, enemy_projectile
 SLOT_MELEE = 1  # vitals[2]: 1 fist/chainsaw, 2 pistol, 3 shotgun, ...
@@ -63,7 +66,14 @@ REVISIT_CAP = 3.0
 
 
 class Shaper:
-    def reset(self, env) -> None:
+    def __init__(self, weapon_discipline: bool = False, loaded_switch_cost: float = 0.05,
+                 *, recovery_feedback: bool = False, height_safe_shaping: bool = False):
+        self.weapon_discipline = weapon_discipline
+        self.loaded_switch_cost = loaded_switch_cost
+        self.recovery_feedback = recovery_feedback
+        self.height_safe_shaping = height_safe_shaping
+
+    def reset(self, env, observation=None) -> None:
         s = env.privileged_state()
         self.prev = s
         self.cells = {self._cell(s)}
@@ -72,11 +82,17 @@ class Shaper:
         self.door_open = self._open(s)  # doors already open at spawn don't count
         self.door_ever = self.door_open.copy()
         self.prev_use = False
+        self.prev_door_opening = False
+        self.prev_attack = False
+        self.prev_switch = False
+        self.prev_observation = observation
+        if self.weapon_discipline:
+            self.damage_dealt = env._game.get_game_variable(GameVariable.DAMAGECOUNT)
         self.stats = dict(ret=0.0, exit=0, death=0, kills=0, keys=0, doors=0, locked=0, cells=1, steps=0, dmg=0.0, prog=0.0)
-        self.nav = navfield.for_env(env) if R["exit_dist"] else None
+        planar = not self.height_safe_shaping or navfield.supports_planar_shaping(env.mapinfo, s["sector_floor"])
+        self.nav = navfield.for_env(env) if R["exit_dist"] and planar else None
         self.d = self.d0 = self.dmin = self._exit_distance(s)
         self.trail = [(s["x"], s["y"])]  # recent positions, for the stall penalty
-        self.prev_ammo = None
         self.entries = {self._cell(s): 1}  # 128-unit area -> times entered this episode
         self.last_cell = self._cell(s)
         self.prev_turn = 0
@@ -107,6 +123,16 @@ class Shaper:
         return bool(np.any(enemy & (np.abs(np.asarray(ent["features"])[:, 1]) < AIM_SIN)))
 
     @staticmethod
+    def _shot_on_target(obs) -> bool:
+        # The center ray includes monster radius and occlusion. Allow an aimed barrel shot,
+        # which can damage a nearby monster after a delay.
+        if obs["rays"]["hit_type"][0] == 4:
+            return True
+        ent = obs["visible_entities"]
+        barrels = ent["features"][(ent["mask"] > 0) & (ent["entity_type"] == 10)]
+        return bool(np.any((barrels[:, 2] > 0) & (np.abs(barrels[:, 1] * barrels[:, 0]) < 10 / 1024)))
+
+    @staticmethod
     def _enemy_visible(obs) -> bool:
         ent = obs["visible_entities"]
         return bool(np.any((np.asarray(ent["mask"]) > 0) & np.isin(np.asarray(ent["entity_type"]), ENEMY_TYPES)))
@@ -129,11 +155,26 @@ class Shaper:
         self.move_pen -= x
         return x
 
+    @staticmethod
+    def _gate_ahead(obs) -> bool:
+        rays = obs["rays"]
+        forward = [63, 0, 1]
+        distance = np.asarray(rays["distance"])[forward]
+        hit_type = np.asarray(rays["hit_type"])[forward]
+        return bool(np.any((distance <= 64 / 1024) & np.isin(hit_type, (2, 3))))
+
     def step(self, env, action, obs, terminated: bool) -> float:
         s = env.privileged_state()
         p = self.prev
         r = R["step"]
         st = self.stats
+        before = self.prev_observation if self.prev_observation is not None else obs
+        landed = 0.0
+        if self.weapon_discipline:
+            dealt = env._game.get_game_variable(GameVariable.DAMAGECOUNT)
+            landed = max(0.0, dealt - self.damage_dealt)
+            self.damage_dealt = dealt
+            r += R["hit_damage"] * landed
         if s["exit_reached"]:
             r += R["exit"] + R["exit_health"] * max(s["health"], 0)
             st["exit"] = 1
@@ -190,17 +231,35 @@ class Shaper:
                 st["locked"] += int(locked.sum())
                 self.door_ever |= now
         use = bool(action[7])
-        if use and not self.prev_use:
-            r += R["use_press"]
+        near_exit = self.nav is not None and self.d < 96.0
+        if use and not self.prev_use and not s["exit_reached"]:
+            if self.prev_door_opening and self._gate_ahead(before):
+                r += R["use_reverse_door"]
+            elif not self._gate_ahead(before) and not near_exit:
+                r += R["use_press"]
         self.prev_use = use
-        if action[6] and not self._enemy_in_sights(obs):
+        aimed = self._shot_on_target(before) if self.recovery_feedback else self._enemy_in_sights(before)
+        if action[6] and not landed and not aimed:
             r += R["attack_no_target"]
+        if bool(action[6]) and self.prev_attack and int(before["vitals"][2]) == 2 and not landed:
+            r += R["pistol_spread"]
+        self.prev_attack = bool(action[6])
+        if self.weapon_discipline:
+            switch = bool(action[8])
+            if switch and not self.prev_switch:
+                r -= 0.01
+                if before["vitals"][3] > 0 and self._enemy_visible(before):
+                    r -= self.loaded_switch_cost
+            self.prev_switch = switch
         if self._fists_with_ammo(obs):
             r += R["fists_with_ammo"]
             st["fists"] = st.get("fists", 0) + 1
         enemy = self._enemy_visible(obs)
         moved = math.hypot(s["x"] - p["x"], s["y"] - p["y"])
-        if action[0] and not action[1] and moved < BUMP_DIST and not enemy and not terminated:
+        attempted_move = bool(action[0] and not action[1])
+        if self.recovery_feedback:
+            attempted_move = bool(action[0] != action[1] or action[2] != action[3])
+        if attempted_move and moved < BUMP_DIST and not enemy and not terminated:
             r += self._move_penalty(R["bump"])  # pressing on into a stair lip or wall
             st["bumps"] = st.get("bumps", 0) + 1
         turn = int(action[4]) - int(action[5])
@@ -223,22 +282,26 @@ class Shaper:
         self.health_d = hd
         # Stall: pinned against a wall or jittering in place for ~2 s (the bot spent the last 40 s of a map
         # turning left/right at one sign). Potential shaping and curiosity pay 0 there, so it needs a cost.
+        opening = bool(self.door_ids.size and not terminated and
+                       np.any(s["sector_ceiling"][self.door_ids] > p["sector_ceiling"][self.door_ids]))
+        self.prev_door_opening = opening
         self.trail.append((s["x"], s["y"]))
         if len(self.trail) > STALL_STEPS:
             self.trail.pop(0)
             xs, ys = zip(*self.trail)
             if max(xs) - min(xs) < STALL_DIST and max(ys) - min(ys) < STALL_DIST and not terminated \
-                    and not self._enemy_visible(obs):  # holding position to fight is fine
+                    and not opening and not self._enemy_visible(obs):  # holding position to fight is fine
                 r += self._move_penalty(R["stall"])
                 st["stall"] = st.get("stall", 0) + 1
         # Ammo spent with no enemy in view at all (rounds of the selected weapon, from the observation).
         vit = np.asarray(obs["vitals"])
-        ammo = float(vit[3])
-        if self.prev_ammo is not None and int(vit[2]) == int(self.prev_slot) and ammo < self.prev_ammo \
-                and not self._enemy_visible(obs):
-            r += R["ammo_wasted"] * (self.prev_ammo - ammo)
-            st["wasted"] = st.get("wasted", 0) + int(self.prev_ammo - ammo)
-        self.prev_ammo, self.prev_slot = ammo, vit[2]
+        prior_vitals = before["vitals"]
+        ammo_spent = float(prior_vitals[3] - vit[3])
+        wasted_shot = not aimed if self.recovery_feedback else not self._enemy_visible(before)
+        if vit[2] == prior_vitals[2] and ammo_spent > 0 and not landed and wasted_shot:
+            r += R["ammo_wasted"] * ammo_spent
+            st["wasted"] = st.get("wasted", 0) + int(ammo_spent)
+        self.prev_observation = obs
         self.prev = s
         st["ret"] += r
         st["steps"] += 1

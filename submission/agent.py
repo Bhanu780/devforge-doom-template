@@ -16,6 +16,7 @@ SUBMISSION_DIR = Path(__file__).resolve().parent
 WEIGHTS = SUBMISSION_DIR / "weights" / "policy.pt"
 sys.path.insert(0, str(SUBMISSION_DIR))
 
+from model.actions import mask_distant_punches, sample_exclusive_numpy  # noqa: E402
 from model.features import FeatureBuilder  # noqa: E402
 from model.policy import DoomPolicy  # noqa: E402
 
@@ -30,15 +31,17 @@ class DoomAgent:
         torch.set_num_threads(1)
         self.action_space = action_space
         self.device = "cpu"  # a ~3 M parameter net at batch 1 is faster on CPU than via CUDA launches
-        self.fb = FeatureBuilder()
         self.rng = np.random.default_rng(0)
         if not WEIGHTS.is_file():
             raise FileNotFoundError(f"Missing trained policy: {WEIGHTS}")
         ckpt = torch.load(WEIGHTS, map_location="cpu", weights_only=False)
         cfg = ckpt.get("config", {})
+        self.exclusive_movement = cfg.get("exclusive_movement", False)
+        self.weapon_discipline = cfg.get("weapon_discipline", False)
         self.model = DoomPolicy(hidden=cfg.get("hidden", 512), use_rgb=cfg.get("use_rgb", True))
         self.model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
         self.model.eval()
+        self.fb = FeatureBuilder(include_rgb=self.model.use_rgb, collision_aware=cfg.get("collision_aware", False))
         self.temperature = TEMPERATURE
         self.reset()
 
@@ -53,13 +56,15 @@ class DoomAgent:
             feats = self.fb.step(observation)
             x = {k: torch.from_numpy(np.asarray(v)).unsqueeze(0).unsqueeze(0) for k, v in feats.items()}
             logits, _, self.h = self.model(x, self.h)
-            p = torch.sigmoid(logits[0, 0] / self.temperature).numpy()
-            action = (self.rng.random(9) < p).astype(np.int8)
-        except Exception as e:  # a crash or invalid action freezes the player for the rest of the map
-            print(f"[agent] act() error: {e!r}", file=sys.stderr)
-            action = np.zeros(9, np.int8)
-        try:
+            if self.weapon_discipline:
+                logits = mask_distant_punches(logits, x)
+            logits = logits[0, 0] / self.temperature
+            if self.exclusive_movement:
+                action = sample_exclusive_numpy(logits, self.rng)
+            else:
+                action = (self.rng.random(9) < logits.sigmoid().numpy()).astype(np.int8)
             self.fb.note_action(action)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[agent] act() error: {exc!r}", file=sys.stderr)
+            action = np.zeros(9, np.int8)
         return action

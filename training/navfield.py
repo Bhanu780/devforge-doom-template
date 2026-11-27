@@ -29,6 +29,7 @@ from doom_env.mapinfo import parse_udmf, udmf_namespace, DOOM_NAMESPACES
 from doom_env.wad import map_lumps, read_wad
 
 CELL = 16.0
+MAX_STEP_UP = 24.0  # vanilla walking limit, in map units
 GRID_OFFSET = 5.3  # map units; see NavField.__init__
 DOOM_EXITS = {11, 51, 52, 124, 197, 198}  # S1/W1/G1 normal and secret exits
 HEXEN_EXITS = {74, 75, 243, 244}  # Teleport_NewMap, Teleport_EndGame, Exit_Normal, Exit_Secret
@@ -79,6 +80,17 @@ def exit_segments(wad: str, map_name: str) -> np.ndarray:
             if special in (HEXEN_EXITS if hexen else DOOM_EXITS) and v1 < len(verts) and v2 < len(verts):
                 out.append(tuple(map(float, verts[v1] + verts[v2])))
     return np.array(out, np.float64).reshape(-1, 4)
+
+
+def supports_planar_shaping(mapinfo, floor: np.ndarray | None) -> bool:
+    """Reject planar shaping if it could route the player up a steep ledge."""
+    lines = mapinfo.lines
+    if lines is None or floor is None:
+        return False
+    two_sided = (lines.front >= 0) & (lines.front < len(floor)) & (lines.back >= 0) & (lines.back < len(floor))
+    openings = two_sided & ~lines.impassable
+    steps = floor[lines.front[openings]] - floor[lines.back[openings]]
+    return bool(np.isfinite(steps).all() and (np.abs(steps) <= MAX_STEP_UP).all())
 
 
 class NavField:

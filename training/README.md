@@ -27,7 +27,7 @@ uv run tensorboard --logdir training/runs                          # watch ep/ex
 ```
 
 - Stop any time with Ctrl+C; continue with `--resume`. `latest.pt` is saved every 20 updates and an
-  fp16 snapshot `policy_XXXXM.pt` every 100 updates.
+  step-numbered FP16 snapshot `policy_000000000.pt` at each save interval.
 - Check a snapshot: `uv run python training/bench.py --weights training/runs/main/policy_0020M.pt --procs 6`.
 - Ship one: copy it to `submission/weights/policy.pt` (or `train.py --run main --export` for the latest), then
   `python validate.py --docker`, then `git add submission/weights/policy.pt && git commit && git push` (Git LFS).
@@ -140,6 +140,189 @@ python training/bench.py --weights training/runs/keycard_bends/candidate.pt --se
 Use the same checkpoint, seed list, and tick cap when comparing navigation maps
 and combat scenarios. The held-out suite measures transfer between layouts.
 
+## Train recovery from missed turns
+
+During extra practice rollouts, `--recovery-rate` lets the initial neural policy
+choose a share of the actions. The trainer records the corrective demonstration
+action for the actual observation and retains completed rollouts. This gives the
+policy practice recovering from its own mistakes. The controller runs only on
+the generated practice maps.
+
+```bash
+python training/imitate_keycard.py --run keycard_recovery --recovery-rate 0.25 --epochs 6 \
+  --init training/runs/keycard_bends/candidate.pt \
+  --combat-reference training/runs/balanced_progression/candidate.pt
+python training/train.py --run keycard_recovery --export --export-path training/runs/keycard_recovery/candidate.pt
+python training/keycard_map.py training/runs/keycard_holdout.wad
+python training/keycard_map.py training/runs/keycard_bent_holdout.wad --layout bent
+python training/bench.py --weights training/runs/keycard_recovery/candidate.pt \
+  --wad training/runs/keycard_holdout.wad --wad training/runs/keycard_bent_holdout.wad \
+  --seeds 4 --procs 2 --ticks 2100
+```
+
+Use `--first-seed 4` to run the next four seeds on both layouts.
+
+## Train combat and keycard progression together
+
+Generate practice layouts with a hitscan enemy before the key, a projectile
+enemy after the door, or both. Fine-tune a copy of the recovery checkpoint so
+the original stays available for comparison. Replace the run name when
+starting a new experiment.
+
+```bash
+python training/keycard_curriculum.py training/runs/keycard_combat_maps
+mkdir -p training/runs/keycard_combat_ppo
+cp training/runs/keycard_recovery/latest.pt training/runs/keycard_combat_ppo/latest.pt
+DOOM_GROUPS=progression=0.65,small=0.20,fd_early=0.15 python training/train.py \
+  --run keycard_combat_ppo --resume --practice-maps training/runs/keycard_combat_maps \
+  --workers 2 --episodes-per-map 1 --steps 128 --chunk 16 --epochs 2 \
+  --lr 0.0001 --ent 0.01 --ent-final 0.01 --curiosity 0.015 --max-updates 32 --save-every 8
+python training/train.py --run keycard_combat_ppo --export --export-path training/runs/keycard_combat_ppo/candidate.pt
+```
+
+Compare the candidate against the recovery checkpoint on the same validation
+maps, seeds, and tick cap. MAP04 stays in the validation pool.
+
+Add `--exclusive-movement` on a separate comparison run to let the model choose
+neither or one button in each opposing pair. PPO and the exported agent share
+that action distribution. Checkpoints saved before this option retain their
+original button sampling.
+
+## Weapon discipline experiment
+
+Add `--weapon-discipline` when fine-tuning from a copied recovery checkpoint.
+The policy uses an observation-based mask for fists when every visible target
+is out of melee range. Switching remains a learned action. During training,
+hits earn a small damage reward and cycling away from a loaded firearm in view
+of an enemy costs a small penalty. The hit counter is used only in training.
+The exported config keeps the mask consistent with PPO's action distribution.
+
+### Design references
+
+- [DeepDoom scenarios](https://github.com/Atlas-Soft/DeepDoom#scenarios) inform the door and exit curriculum.
+- [CleanRL recurrent PPO](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_lstm.py) is a reference for recurrent state reset and sequence batching.
+- [ViZDoom scenarios](https://github.com/Farama-Foundation/ViZDoom/blob/main/docs/environments/default.md) provide distinct combat and exploration practice tasks.
+- [StarNet demos](https://github.com/Trinkle23897/VizDoom2018-Track1) illustrate the combat-to-progression sequences we measure in the mixed maps.
+- [Curiosity-driven exploration](https://github.com/pathak22/noreward-rl) informs the novelty objective. This implementation uses counts from its own memory map.
+
+## Inspect and tune combat independently
+
+Run the held-out benchmark with `--combat-stats` to record decisions with the
+fist selected, out-of-range punches, weapon-switch presses, switches from a
+loaded weapon while an enemy is visible, and hits. The benchmark reads engine
+counters after the policy acts.
+
+To isolate combat learning, copy a completed checkpoint to a new run and add
+`--combat-head-only --weapon-discipline` when resuming the trainer.
+This freezes the observation encoders, recurrent memory, and the actor's
+navigation and interaction output rows. PPO updates the attack and
+weapon-selection rows and the value head. A fresh optimizer is created on the
+first combat-only resume. Use `--no-combat-head-only` to resume full-policy
+training with a fresh optimizer. Use `--loaded-switch-cost` to compare different
+training penalties for cycling away from a loaded weapon under threat.
+
+## Vary combat layouts and starting conditions
+
+Generate combat practice separately from the arena benchmark. Practice covers
+open rooms, pillars, chokepoints, and alternate routes, with four spawn
+configurations per layout. The validation layouts use different cover and
+enemy placements.
+
+```bash
+python training/combat_maps.py training/runs/arenas_train
+python training/combat_maps.py training/runs/arenas_val --split val
+```
+
+Pass only `training/runs/arenas_train` to `train.py --arena-maps`. Combine it
+with the existing keycard practice maps and bundled Freedoom training levels:
+
+```bash
+DOOM_GROUPS=arena=0.35,progression=0.35,small=0.10,fd_early=0.10,fd=0.10 \
+  python training/train.py --run arenas_combat_only --resume --weapon-discipline \
+  --combat-head-only --arena-maps training/runs/arenas_train \
+  --practice-maps training/runs/keycard_combat_maps \
+  --workers 2 --episodes-per-map 1 --steps 128 --chunk 16 --epochs 2 --lr 0.0001 \
+  --loaded-switch-cost 0.08 --ent 0.01 --ent-final 0.01 --curiosity 0.015 --max-updates 48 --save-every 8
+```
+
+Seed each comparison run with a separate copy of the same starting checkpoint.
+Use `--no-combat-head-only` for the full-policy comparison. Evaluate candidates
+on the same reserved arenas, keycard layouts, and Freedoom maps.
+
+## Teach exit navigation from more starting points
+
+The exit lessons use cleared practice arenas so the model can learn movement
+after an encounter as a separate skill. Each floor plan has several start
+positions and headings. Only the demonstration collector follows those routes.
+The neural policy is evaluated through the same observation-only entry point.
+
+Enable RGB and depth in a separate warm-start experiment. The visual input
+starts with zero contribution to the existing policy, then learns during
+imitation. Rehearsing earlier combat decisions keeps combat examples in the
+training batches.
+
+```bash
+python training/imitate_keycard.py --run arena_exit_rgb \
+  --init training/runs/arenas_combat_only/candidate.pt \
+  --combat-reference training/runs/arenas_full_policy/candidate.pt \
+  --enable-rgb --arena-exits --epochs 5
+python training/train.py --run arena_exit_rgb --export --export-path training/runs/arena_exit_rgb/candidate.pt
+```
+
+Compare the finished checkpoint on the reserved arena floor plans, keycard maps,
+and broader Freedoom suite before continuing PPO or promoting it.
+
+## Sweep the public maps and diagnose gate stalls
+
+Use the public split to run all bundled Freedoom maps, ViZDoom scenarios, the
+official two-room map, and the repository's test fixtures. It reports attempts
+with errors separately and prints a row as each episode finishes. Use this as a
+diagnostic across the public material. The `val` split and reserved WADs remain
+separate from checkpoint training.
+
+```bash
+python training/bench.py --weights training/runs/arenas_combat_only/candidate.pt \
+  --split public --seeds 1 --ticks 4200 --procs 2 --combat-stats --progress-stats
+```
+
+`near_gate` counts decisions with a door ray close and ahead. `gate_use` counts
+fresh Use presses during those decisions. `stale_tail` counts decisions since
+the last newly visited cell. These are local diagnostics, separate from the
+official scoring criteria.
+
+Train gate and exit interaction on authored rooms with doors approached from
+several sides and varied initial headings.
+
+```bash
+python training/imitate_keycard.py --run gate_lessons --gate-lessons --arena-exits \
+  --init training/runs/arenas_combat_only/candidate.pt \
+  --combat-reference training/runs/arenas_full_policy/candidate.pt --epochs 5
+python training/train.py --run gate_lessons --export --export-path training/runs/gate_lessons/candidate.pt
+```
+
+## Watch long runs in TensorBoard
+
+Install TensorBoard in the project environment and point it at the training run.
+The trainer writes the scalar files automatically.
+
+```bash
+source .venv/bin/activate
+uv pip install tensorboard
+tensorboard --logdir training/runs/long_gate_ppo --host 127.0.0.1 --port 6006
+```
+
+Open http://localhost:6006/ and select Scalars. `ep/exit` is the rolling training
+exit rate. `ep/death`, `ep/doors`, and `ep/cells` track the corresponding
+training outcomes. Compare saved checkpoints on a separate benchmark before
+choosing submission weights.
+
+For a longer PPO run, `--navigation-anchor 0.25` adds a soft penalty if movement
+and Use probabilities drift from the starting checkpoint. It leaves the attack
+and weapon-switch distributions outside that penalty. The trainer stores the
+reference in the run directory so it can be restored on resume. Pass the same
+anchor strength when resuming. Every save interval produces an immutable
+step-numbered export for evaluation, and the final update is saved even when
+it falls between intervals.
 ## Harder generated levels
 
 `training/hard_levels.py` generates random corridor levels in three tiers: decoy dead-ends with a
@@ -190,3 +373,85 @@ policy learns to switch back. Episode logs report it as `fists`.
 | `under_fire_strafe` | +0.004 per step strafing within 12 steps of being hit | dodging instead of trading head-on |
 
 Episode logs add `revisits`, `bumps`, `healed` and `stall`.
+
+## Longer mixed training
+
+Use different seeds and map families during training. The long local run mixes
+Freedoom maps, generated hard keycard levels, combat arenas, and original gate
+practice. The held-out hard levels are excluded from the training pool.
+
+Action rewards use the frame before the button press when judging target
+visibility, ammo waste, and whether a gate is close enough to use. During
+weapon-discipline training, a confirmed hit receives small credit. Opening a
+gate remains a progression event, and waiting while it opens avoids the stall
+penalty. The exit bonus remains the largest single reward.
+
+The checkpoint filenames contain the cumulative number of game decisions. Keep
+the starting weights and benchmark immutable snapshots on the same maps and
+seeds. The long run's local resume script records its mixture and exact
+training budget in the run directory.
+
+For a deadline-sized comparison, resume from a copied checkpoint with
+`--epochs 1 --minibatches 2`, set a short absolute `--max-updates`, and save
+at several intervals. One pass per rollout reduces learner time. Compare the
+candidate against its starting weights before using it. No-RGB rollouts omit
+the unused image tensors, and the recurrent model processes uninterrupted
+sequences in batches while resetting memory at episode boundaries.
+
+## Wall recovery and combat precision
+
+`--collision-aware` uses the velocity corrected by the static raycast scan for the
+policy's stuck feature. During training, blocked strafing and reversing receive
+the same bounded penalty as blocked forward motion. Shots use the pre-action
+center ray and measured damage for credit. Aimed shots at barrels are allowed
+in the reward, since barrels can damage nearby enemies. The inference action
+selection still comes from the same recurrent policy.
+
+Start a run from a compatible exported policy with `--init-weights path/to/policy.pt`.
+This starts a new optimizer and step counter. Use `--resume` to continue that run
+with its optimizer, feature configuration, and step counter.
+
+```bash
+python training/hard_levels.py training/runs/recovery_practice --count 48 --seed 23061
+DOOM_GROUPS=fd_early=0.40,fd=0.10,arena=0.15,small=0.10,progression=0.20,hard=0.05 \
+  python training/train.py --run recovery_mixed --init-weights path/to/policy.pt \
+  --collision-aware --weapon-discipline --seed 913 --workers 2 --steps 128 \
+  --epochs 1 --minibatches 2 --lr 0.0001 --navigation-anchor 0.07 \
+  --practice-maps training/runs/recovery_practice --arena-maps training/runs/arenas_train \
+  --episodes-per-map 1 --max-updates 128 --save-every 32
+```
+
+Compare MAP01 runs with `behavior_eval.py --maps MAP01 --seeds 2 --ticks 4200`.
+MAP01 is a development map in the training pool. Check transfer with `bench.py --split hard`
+and reserved Freedoom maps such as MAP04.
+
+`--height-safe-shaping` disables the planar exit-distance reward when a level has
+two-sided openings with a floor height difference above the vanilla walking
+limit. For example, the planar field in Freedoom MAP01 estimates a shorter route
+straight across a 64-unit ledge. The other progression, survival, and exploration
+rewards stay active. This is a conservative check at episode reset. It does not
+model lifts or resolve routes across ledges.
+
+### Reproduce the final keycard evaluation
+
+From the repository root, in the project environment with Git LFS weights downloaded,
+run the following in Bash. It generates four levels in each of the three local
+difficulty tiers and evaluates the submitted checkpoint once per level.
+
+```bash
+level_dir=$(mktemp -d)
+python training/hard_levels.py "$level_dir" --count 12 --seed 809271
+wad_args=()
+for level in "$level_dir"/*.wad; do
+    wad_args+=(--wad "$level")
+done
+python training/bench.py "${wad_args[@]}" --first-seed 17 --seeds 1 --ticks 2100 --procs 1
+```
+
+The selected checkpoint reached 3 exits in 12 episodes, collected at least one
+key in 8 episodes, and survived all 12. The three exits occurred on layouts
+hard_t1_03, hard_t2_01, and hard_t2_04. Five episodes ended with a key collected
+and no exit. A later recovery-trained checkpoint exited once and died twice on
+the same levels. Lowering the selected checkpoint's sampling temperature to
+0.85 yielded two exits and two deaths. These are local comparisons using
+team-generated maps. The six official evaluation maps are unseen.
