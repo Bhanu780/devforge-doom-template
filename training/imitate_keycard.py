@@ -25,11 +25,11 @@ from model.actions import mask_distant_punches, movement_logits, sample_exclusiv
 
 @torch.inference_mode()
 def collect_episode(path, route, seed, use_rgb, ticks=2100, *, student=None, rng=None, recovery_rate=0.0,
-                    exclusive_movement=False, weapon_discipline=False):
+                    exclusive_movement=False, weapon_discipline=False, collision_aware=False):
     """Collect demonstrations with optional per-door sector waypoints."""
     with closing(make_env(path, episode_ticks=ticks, render_buffers=use_rgb)) as env:
         observation, _ = env.reset(seed=seed)
-        features = FeatureBuilder()
+        features = FeatureBuilder(include_rgb=use_rgb, collision_aware=collision_aware)
         features.reset()
         inputs, actions = [], []
         waypoint = 0
@@ -94,7 +94,7 @@ def collect_episode(path, route, seed, use_rgb, ticks=2100, *, student=None, rng
 
 
 @torch.inference_mode()
-def collect_combat(reference, seed, device, exclusive_movement=False, weapon_discipline=False, render_rgb=False):
+def collect_combat(reference, seed, device, exclusive_movement=False, weapon_discipline=False, render_rgb=False, collision_aware=False):
     """Keep examples of the previous policy's combat actions on training maps."""
     scenarios = {"basic", "defend_the_center", "deadly_corridor", "rocket_basic"}
     episodes = []
@@ -104,7 +104,7 @@ def collect_combat(reference, seed, device, exclusive_movement=False, weapon_dis
         with closing(make_env(wad, map_name, episode_ticks=768, render_buffers=reference.use_rgb or render_rgb)) as env:
             for offset in range(2):
                 observation, _ = env.reset(seed=seed + offset)
-                features = FeatureBuilder()
+                features = FeatureBuilder(include_rgb=reference.use_rgb or render_rgb, collision_aware=collision_aware)
                 features.reset()
                 hidden = reference.initial_state(1, device)
                 inputs, actions = [], []
@@ -216,6 +216,7 @@ def main():
         with torch.no_grad():
             model.fuse[0].weight[:, 640:896].zero_()
     run = ROOT / "training" / "runs" / args.run
+    collision_aware = config.get("collision_aware", False)
     episodes = []
     recovered = []
     model.eval()
@@ -223,13 +224,14 @@ def main():
         successes = 0
         for variation in range(4):
             path, route = build_practice_map(run / "maps", layout, variation)
-            episode = collect_episode(path, route, args.seed + variation, model.use_rgb)
+            episode = collect_episode(path, route, args.seed + variation, model.use_rgb, collision_aware=collision_aware)
             if episode is not None:
                 episodes.append(episode)
                 successes += 1
             if args.recovery_rate and variation % 2 == layout % 2:
                 recovery = collect_episode(path, route, args.seed + variation, model.use_rgb,
                                            student=model, rng=rng, recovery_rate=args.recovery_rate,
+                                           collision_aware=collision_aware,
                                            exclusive_movement=config.get("exclusive_movement", False),
                                            weapon_discipline=config.get("weapon_discipline", False))
                 if recovery is not None:
@@ -238,7 +240,7 @@ def main():
     if args.hard_levels:
         successes = 0
         for path, route, _ in build_hard_set(run / "maps", args.hard_levels, args.seed):
-            episode = collect_episode(path, route, args.seed, model.use_rgb, ticks=4200)
+            episode = collect_episode(path, route, args.seed, model.use_rgb, ticks=4200, collision_aware=collision_aware)
             if episode is not None:
                 episodes.append(episode)
                 successes += 1
@@ -251,7 +253,7 @@ def main():
     if args.gate_lessons:
         gate_episodes = []
         for path, route in build_gate_lessons(run / "gate_maps"):
-            episode = collect_episode(path, route, args.seed, model.use_rgb)
+            episode = collect_episode(path, route, args.seed, model.use_rgb, collision_aware=collision_aware)
             if episode is not None:
                 gate_episodes.append(episode)
         if not gate_episodes:
@@ -261,7 +263,7 @@ def main():
     if args.arena_exits:
         arena_episodes = []
         for path, route in build_exit_lessons(run / "exit_maps"):
-            episode = collect_episode(path, route, args.seed, model.use_rgb)
+            episode = collect_episode(path, route, args.seed, model.use_rgb, collision_aware=collision_aware)
             if episode is not None:
                 arena_episodes.append(episode)
         if not arena_episodes:
@@ -275,7 +277,7 @@ def main():
         combat = collect_combat(reference.eval(), args.seed, device,
                                 exclusive_movement=prior["config"].get("exclusive_movement", False),
                                 weapon_discipline=prior["config"].get("weapon_discipline", False),
-                                render_rgb=model.use_rgb)
+                                render_rgb=model.use_rgb, collision_aware=collision_aware)
         print(f"adding {len(combat)} combat episodes from the reference policy", flush=True)
         episodes.extend(combat)
     print(f"training on {len(episodes)} episodes, {sum(len(actions) for _, actions in episodes)} decisions", flush=True)
