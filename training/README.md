@@ -431,3 +431,27 @@ limit. For example, the planar field in Freedoom MAP01 estimates a shorter route
 straight across a 64-unit ledge. The other progression, survival, and exploration
 rewards stay active. This is a conservative check at episode reset. It does not
 model lifts or resolve routes across ledges.
+
+### Reproduce the final keycard evaluation
+
+From the repository root, in the project environment with Git LFS weights downloaded,
+run the following in Bash. It generates four levels in each of the three local
+difficulty tiers and evaluates the submitted checkpoint once per level.
+
+```bash
+level_dir=$(mktemp -d)
+python training/hard_levels.py "$level_dir" --count 12 --seed 809271
+wad_args=()
+for level in "$level_dir"/*.wad; do
+    wad_args+=(--wad "$level")
+done
+python training/bench.py "${wad_args[@]}" --first-seed 17 --seeds 1 --ticks 2100 --procs 1
+```
+
+The selected checkpoint reached 3 exits in 12 episodes, collected at least one
+key in 8 episodes, and survived all 12. The three exits occurred on layouts
+hard_t1_03, hard_t2_01, and hard_t2_04. Five episodes ended with a key collected
+and no exit. A later recovery-trained checkpoint exited once and died twice on
+the same levels. Lowering the selected checkpoint's sampling temperature to
+0.85 yielded two exits and two deaths. These are local comparisons using
+team-generated maps. The six official evaluation maps are unseen.
